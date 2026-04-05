@@ -1,0 +1,15 @@
+[Unit]
+Description=Discord Auto Answer Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/discordanswer
+EnvironmentFile=/path/to/discordanswer/.env
+ExecStart=/usr/bin/python3 /path/to/discordanswer/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
