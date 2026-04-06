@@ -29,6 +29,7 @@ SYSTEM_PROMPT = os.environ.get(
 )
 HISTORY_FETCH_LIMIT = int(os.environ.get("HISTORY_FETCH_LIMIT", "200"))
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "30"))
+MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "80000"))
 
 # --- Conductor FW リファレンス ---
 FW_REFERENCE = """
@@ -241,7 +242,12 @@ async def fetch_server_context(guild: discord.Guild) -> str:
                 all_history.extend(history)
                 all_history.append("")
 
-    return "\n".join(all_history)
+    context = "\n".join(all_history)
+    # Truncate to stay within token limits
+    if len(context) > MAX_CONTEXT_CHARS:
+        logger.warning("コンテキストが%d文字→%d文字に切り詰め", len(context), MAX_CONTEXT_CHARS)
+        context = context[-MAX_CONTEXT_CHARS:]
+    return context
 
 
 async def generate_answer(question: str, server_context: str) -> str:
