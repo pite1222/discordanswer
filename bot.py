@@ -30,6 +30,81 @@ SYSTEM_PROMPT = os.environ.get(
 HISTORY_FETCH_LIMIT = int(os.environ.get("HISTORY_FETCH_LIMIT", "200"))
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "30"))
 
+# --- Conductor FW リファレンス ---
+FW_REFERENCE = """
+## Conductor キーボード ファームウェア情報
+リポジトリ: https://github.com/pite1222/conductor (branch: zephyr-4.1)
+
+### ハードウェア構成
+- MCU: Seeeduino Xiao BLE (nRF52840)
+- 分割キーボード: 右手(monokey_R)=セントラル+トラックボール、左手(monokey_L)=ペリフェラル
+- トラックボール: PMW3610 (SPI接続、CPI: 800)
+- RGB LED: WS2812B (rgbled_adapter シールド経由)
+- バッテリー監視: LED表示対応
+- 充電検出: GPIO P0.17
+- レイアウト: 40キー (4行×10列、スプリットスペースバー)
+
+### キーマップレイヤー (7レイヤー)
+| レイヤー | 名前 | 用途 |
+|----------|------|------|
+| 0 | default | QWERTY配列 + 修飾キー |
+| 1 | FUNCTION | 記号・特殊文字・スクリーンショット (Space長押し) |
+| 2 | NUM | 数字行(F1-F12) + テンキー (Backspace長押し) |
+| 3 | ARROW | 矢印キー + Vim風ナビゲーション + メディア制御 (Enter長押し) |
+| 4 | MOUSE | マウスボタン (トラックボール動作で自動切替: AML) |
+| 5 | SCROLL | スクロール (トラックボールXY→スクロール変換) |
+| 6 | Bluetooth | BT接続(5台) + ブートローダー + リセット |
+
+### 主な機能
+- Mod-tap: Z=左Shift長押し、/=右Shift長押し
+- Layer-tap: Space=Layer1、Backspace=Layer2、Enter=Layer3
+- コンボ: A+S → A (51msタイムアウト)
+- エンコーダ: デフォルト=PageUp/Down、矢印レイヤー=Ctrl+PgUp/PgDn
+- Auto Mouse Layer (AML): トラックボール動作で自動的にLayer4起動、5秒タイムアウト
+- スクロールレイヤー: Layer5でトラックボール→スクロール変換 (1/8スケール)
+- ZMK Studio: Chrome経由でリモートキーマップ編集可能
+
+### RGB LED表示
+- レイヤー色: Layer0=消灯、Layer1=色4、Layer2=色2、Layer3=色3
+- バッテリー: 50%以上=緑、10-50%=黄、10%未満=赤、5%=点滅(4秒間隔)
+- BLE接続中: 点滅(800ms間隔)
+
+### キーマップ変更方法
+1. ファイル: config/boards/shields/monokey/monokey.keymap
+2. ZMKデバイスツリー形式で記述
+3. 主なバインディング: &kp(通常キー)、&mt(モッドタップ)、&lt(レイヤータップ)、&mkp(マウスクリック)
+4. ZMK Studioでリモート編集も可能
+
+### ビルド・フラッシュ手順
+1. GitHub Actionsで自動ビルド (pushで発火)
+2. 出力: zmk.uf2 ファイル
+3. フラッシュ: Xiao BLEのリセットボタン2回タップ → USBドライブにzmk.uf2をドラッグ&ドロップ
+4. ビルドターゲット: monokey_R+rgbled_adapter、monokey_L+rgbled_adapter、settings_reset
+
+### トラブルシューティング
+| 症状 | 原因 | 解決方法 |
+|------|------|----------|
+| トラックボールが反応しない/暴走 | AMLタイムアウト or CPI設定 | input-processorsタイムアウト調整 or CPI値変更 |
+| キーが反応しない | NFCピン未解放 | nfct-pins-as-gpios確認 |
+| LEDのレイヤー色が出ない | RGBウィジェット未有効 | CONFIG_RGBLED_WIDGET=y確認 |
+| BLE接続が不安定 | 接続間隔の不一致 | BT_PERIPHERAL_PREF_MIN_INT=6確認 |
+| 左右が繋がらない | セントラル/ペリフェラル設定 | 右=central、左=peripheral確認、settings_resetフラッシュ |
+| 設定がおかしくなった | 設定破損 | settings_resetビルドをフラッシュ後、通常FWを再フラッシュ |
+
+### BLE設定
+- デバイス名: "conductor"
+- 最大接続数: 5台
+- ペアリング記憶: 7台
+- 拡張アドバタイジング対応 (低消費電力)
+- 接続間隔: 7.5ms固定
+
+### 依存関係
+- ZMK: pite1222/zmk feat/pointing-studio ブランチ
+- PMW3610ドライバ: badjeff/zmk-pmw3610-driver
+- RGBウィジェット: zmk-rgbled-widget
+- 充電インジケータ: zmk-feature-charge-indicator
+"""
+
 # 全履歴を取得する優先チャンネル名 (カンマ区切り、部分一致)
 PRIORITY_CHANNEL_NAMES = [
     name.strip().lower()
@@ -173,10 +248,17 @@ async def generate_answer(question: str, server_context: str) -> str:
     """サーバーの履歴をコンテキストとして、Claude API で回答を生成する。"""
     system = f"""{SYSTEM_PROMPT}
 
+以下はConductorキーボードのファームウェア技術情報です。
+キーボードの機能・設定・トラブルシューティングに関する質問にはこの情報を参照して回答してください。
+
+--- ファームウェアリファレンス ---
+{FW_REFERENCE}
+--- リファレンスここまで ---
+
 以下はこのDiscordサーバー内のメッセージ履歴です。
 特に「トラブルシューティング」チャンネルには過去の全履歴が含まれています。
-質問に回答する際は、このサーバーの内容・過去のやり取りを踏まえて回答してください。
-サーバーの履歴に関連する情報がない場合は、その旨を伝えた上で一般的な知識で回答してください。
+質問に回答する際は、上記のFW情報とサーバーの過去のやり取りの両方を踏まえて回答してください。
+サーバーの履歴に関連する情報がない場合は、FW情報や一般的な知識で回答してください。
 
 --- サーバー履歴 ---
 {server_context}
@@ -237,12 +319,12 @@ async def on_message(message: discord.Message):
     if TARGET_CHANNEL_IDS and message.channel.id not in TARGET_CHANNEL_IDS:
         return
 
-    # 質問判定
-    if not is_question(message.content):
+    # 空メッセージは無視
+    if not message.content.strip():
         return
 
     logger.info(
-        "質問検出 [#%s] %s: %s",
+        "メッセージ検出 [#%s] %s: %s",
         message.channel.name,
         message.author.name,
         message.content[:80],
