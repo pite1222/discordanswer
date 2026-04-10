@@ -39,8 +39,19 @@ PRIORITY_CHANNEL_NAMES = [
     if name.strip()
 ]
 
+# --- Advisor Strategy ---
+ADVISOR_TOOL = {
+    "type": "advisor_20260301",
+    "name": "advisor",
+    "model": ADVISOR_MODEL,
+    "max_uses": ADVISOR_MAX_USES,
+}
+ADVISOR_HEADERS = {"anthropic-beta": "advisor-tool-2026-03-01"}
+
 # --- Claude クライアント ---
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+logger.info("Claude SDK v%s / model=%s / advisor=%s (max_uses=%d)",
+            anthropic.__version__, CLAUDE_MODEL, ADVISOR_MODEL, ADVISOR_MAX_USES)
 
 # --- Discord ボット ---
 intents = discord.Intents.default()
@@ -189,16 +200,11 @@ async def generate_answer(question: str, server_context: str) -> str:
         max_tokens=2048,
         system=system,
         messages=[{"role": "user", "content": question}],
-        tools=[
-            {
-                "type": "advisor_20260301",
-                "name": "advisor",
-                "model": ADVISOR_MODEL,
-                "max_uses": ADVISOR_MAX_USES,
-            },
-        ],
-        extra_headers={"anthropic-beta": "advisor-tool-2026-03-01"},
+        tools=[ADVISOR_TOOL],
+        extra_headers=ADVISOR_HEADERS,
     )
+    logger.info("Claude応答: stop_reason=%s, blocks=%d",
+                response.stop_reason, len(response.content))
     return "".join(
         block.text for block in response.content if hasattr(block, "text")
     )
