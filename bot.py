@@ -261,13 +261,8 @@ async def on_message(message: discord.Message):
         logger.info("  -> チャンネル対象外 (監視: %s)", TARGET_CHANNEL_IDS)
         return
 
-    # 質問判定
-    if not is_question(message.content):
-        logger.info("  -> 質問ではないと判定")
-        return
-
     logger.info(
-        "質問検出 [#%s] %s: %s",
+        "応答開始 [#%s] %s: %s",
         message.channel.name,
         message.author.name,
         message.content[:80],
