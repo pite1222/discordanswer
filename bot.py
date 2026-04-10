@@ -262,9 +262,15 @@ async def fetch_channel_history(channel: discord.TextChannel, limit: int = 200) 
     return messages
 
 
+MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "50000"))
+
+
 async def fetch_server_context(guild: discord.Guild) -> str:
     all_history = []
+    total_chars = 0
     for channel in guild.text_channels:
+        if total_chars >= MAX_CONTEXT_CHARS:
+            break
         permissions = channel.permissions_for(guild.me)
         if not permissions.read_messages or not permissions.read_message_history:
             continue
@@ -272,16 +278,25 @@ async def fetch_server_context(guild: discord.Guild) -> str:
             await update_priority_cache(channel)
             history = priority_cache.get(channel.id, [])
             if history:
-                all_history.append(f"=== #{channel.name} (全履歴 {len(history)}件) ===")
-                all_history.extend(history)
+                # Use only the most recent messages to stay within limits
+                recent = history[-300:]
+                header = f"=== #{channel.name} (最新{len(recent)}件 / 全{len(history)}件) ==="
+                all_history.append(header)
+                all_history.extend(recent)
                 all_history.append("")
+                total_chars += sum(len(m) for m in recent)
         else:
             history = await fetch_channel_history(channel, limit=HISTORY_FETCH_LIMIT)
             if history:
                 all_history.append(f"=== #{channel.name} ===")
                 all_history.extend(history)
                 all_history.append("")
-    return "\n".join(all_history)
+                total_chars += sum(len(m) for m in history)
+
+    result = "\n".join(all_history)
+    if len(result) > MAX_CONTEXT_CHARS:
+        result = result[-MAX_CONTEXT_CHARS:]
+    return result
 
 
 async def generate_answer(question: str, server_context: str) -> str:
