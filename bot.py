@@ -22,7 +22,9 @@ TARGET_CHANNEL_IDS = {
     for cid in os.environ.get("TARGET_CHANNEL_IDS", "").split(",")
     if cid.strip()
 }
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-opus-4-6")
+ADVISOR_MAX_USES = int(os.environ.get("ADVISOR_MAX_USES", "2"))
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "あなたはDiscordサーバーの親切なアシスタントです。質問に対して簡潔で分かりやすい日本語で回答してください。",
@@ -184,11 +186,22 @@ async def generate_answer(question: str, server_context: str) -> str:
 
     response = claude.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1024,
+        max_tokens=2048,
         system=system,
         messages=[{"role": "user", "content": question}],
+        tools=[
+            {
+                "type": "advisor_20260301",
+                "name": "advisor",
+                "model": ADVISOR_MODEL,
+                "max_uses": ADVISOR_MAX_USES,
+            },
+        ],
+        extra_headers={"anthropic-beta": "advisor-tool-2026-03-01"},
     )
-    return response.content[0].text
+    return "".join(
+        block.text for block in response.content if hasattr(block, "text")
+    )
 
 
 @bot.event
