@@ -262,7 +262,7 @@ async def fetch_channel_history(channel: discord.TextChannel, limit: int = 200) 
     return messages
 
 
-MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "50000"))
+MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "15000"))
 
 
 async def fetch_server_context(guild: discord.Guild) -> str:
@@ -279,7 +279,7 @@ async def fetch_server_context(guild: discord.Guild) -> str:
             history = priority_cache.get(channel.id, [])
             if history:
                 # Use only the most recent messages to stay within limits
-                recent = history[-300:]
+                recent = history[-100:]
                 header = f"=== #{channel.name} (最新{len(recent)}件 / 全{len(history)}件) ==="
                 all_history.append(header)
                 all_history.extend(recent)
