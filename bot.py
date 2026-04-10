@@ -252,12 +252,18 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    logger.info("MSG [#%s] ch_id=%s %s: %s",
+                getattr(message.channel, 'name', '?'), message.channel.id,
+                message.author.name, message.content[:80])
+
     # チャンネルフィルタ (未設定なら全チャンネル対象)
     if TARGET_CHANNEL_IDS and message.channel.id not in TARGET_CHANNEL_IDS:
+        logger.info("  -> チャンネル対象外 (監視: %s)", TARGET_CHANNEL_IDS)
         return
 
     # 質問判定
     if not is_question(message.content):
+        logger.info("  -> 質問ではないと判定")
         return
 
     logger.info(
