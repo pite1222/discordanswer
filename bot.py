@@ -1,9 +1,11 @@
 import os
 import logging
+import base64
 from datetime import datetime, timedelta, timezone
 
 import anthropic
 import discord
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,6 +34,11 @@ SYSTEM_PROMPT = os.environ.get(
 HISTORY_FETCH_LIMIT = int(os.environ.get("HISTORY_FETCH_LIMIT", "200"))
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "30"))
 
+# GitHub settings
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "pite1222/conductor")
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "zephyr-4.1")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
 # 全履歴を取得する優先チャンネル名 (カンマ区切り、部分一致)
 PRIORITY_CHANNEL_NAMES = [
     name.strip().lower()
@@ -48,10 +55,128 @@ ADVISOR_TOOL = {
 }
 ADVISOR_HEADERS = {"anthropic-beta": "advisor-tool-2026-03-01"}
 
+# --- GitHub Tools ---
+GITHUB_TOOLS = [
+    {
+        "name": "get_repo_tree",
+        "description": "GitHubリポジトリのディレクトリ構造を取得する。パスを指定するとそのディレクトリの中身を返す。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "取得するディレクトリパス（例: 'config', 'boards/shields'）。ルートの場合は空文字。",
+                    "default": "",
+                }
+            },
+        },
+    },
+    {
+        "name": "get_file_contents",
+        "description": "GitHubリポジトリから指定したファイルの内容を取得する。コード、設定ファイル、READMEなどを読む時に使う。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "ファイルパス（例: 'config/conductor.keymap', 'README.md'）",
+                }
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "search_code",
+        "description": "GitHubリポジトリ内のコードを検索する。キーワードに一致するファイルとコード断片を返す。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "検索クエリ（例: 'LED', 'battery', 'PMW3610'）",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+]
+
+# --- GitHub API helpers ---
+_http = httpx.Client(timeout=15)
+
+
+def _github_headers() -> dict:
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    return headers
+
+
+def github_get_tree(path: str = "") -> str:
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    params = {"ref": GITHUB_BRANCH}
+    resp = _http.get(url, headers=_github_headers(), params=params)
+    if resp.status_code != 200:
+        return f"Error: {resp.status_code} {resp.text[:200]}"
+    items = resp.json()
+    if isinstance(items, dict):
+        # Single file, not a directory
+        return f"{items['name']} ({items['type']}, {items.get('size', '?')} bytes)"
+    lines = []
+    for item in items:
+        icon = "📁" if item["type"] == "dir" else "📄"
+        size = f" ({item.get('size', '?')}B)" if item["type"] == "file" else ""
+        lines.append(f"{icon} {item['path']}{size}")
+    return "\n".join(lines)
+
+
+def github_get_file(path: str) -> str:
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    params = {"ref": GITHUB_BRANCH}
+    resp = _http.get(url, headers=_github_headers(), params=params)
+    if resp.status_code != 200:
+        return f"Error: {resp.status_code} — file not found or inaccessible"
+    data = resp.json()
+    if data.get("type") != "file":
+        return f"Error: '{path}' is a directory, not a file. Use get_repo_tree instead."
+    content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    # Truncate very large files
+    if len(content) > 8000:
+        content = content[:8000] + f"\n\n... (truncated, total {len(content)} chars)"
+    return content
+
+
+def github_search_code(query: str) -> str:
+    url = "https://api.github.com/search/code"
+    params = {"q": f"{query} repo:{GITHUB_REPO}"}
+    resp = _http.get(url, headers=_github_headers(), params=params)
+    if resp.status_code != 200:
+        return f"Error: {resp.status_code} {resp.text[:200]}"
+    data = resp.json()
+    if data["total_count"] == 0:
+        return f"No results found for '{query}'"
+    results = []
+    for item in data["items"][:10]:
+        results.append(f"📄 {item['path']}")
+    return f"Found {data['total_count']} files:\n" + "\n".join(results)
+
+
+def handle_tool_call(name: str, input_data: dict) -> str:
+    logger.info("Tool call: %s(%s)", name, input_data)
+    if name == "get_repo_tree":
+        return github_get_tree(input_data.get("path", ""))
+    elif name == "get_file_contents":
+        return github_get_file(input_data["path"])
+    elif name == "search_code":
+        return github_search_code(input_data["query"])
+    return f"Unknown tool: {name}"
+
+
 # --- Claude クライアント ---
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-logger.info("Claude SDK v%s / model=%s / advisor=%s (max_uses=%d)",
-            anthropic.__version__, CLAUDE_MODEL, ADVISOR_MODEL, ADVISOR_MAX_USES)
+logger.info("Claude SDK v%s / model=%s / advisor=%s (max_uses=%d) / repo=%s@%s",
+            anthropic.__version__, CLAUDE_MODEL, ADVISOR_MODEL, ADVISOR_MAX_USES,
+            GITHUB_REPO, GITHUB_BRANCH)
 
 # --- Discord ボット ---
 intents = discord.Intents.default()
@@ -60,29 +185,18 @@ intents.members = True
 bot = discord.Client(intents=intents)
 
 # --- 優先チャンネルの全履歴キャッシュ ---
-# { channel_id: [formatted_message, ...] }
 priority_cache: dict[int, list[str]] = {}
-# 最後にキャッシュしたメッセージのID (差分取得用)
 priority_cache_last_id: dict[int, int] = {}
 
 
 def is_priority_channel(channel: discord.TextChannel) -> bool:
-    """優先チャンネル（全履歴取得対象）かどうかを判定する。"""
     name = channel.name.lower()
     return any(keyword in name for keyword in PRIORITY_CHANNEL_NAMES)
 
 
-def is_question(text: str) -> bool:
-    """メッセージが質問かどうかを簡易判定する。"""
-    question_markers = ["?", "？", "教えて", "分かる", "わかる", "どう", "なぜ", "なに", "何"]
-    return any(marker in text for marker in question_markers)
-
-
 def format_message(msg: discord.Message) -> str:
-    """メッセージをテキスト形式にフォーマットする。"""
     timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
     text = f"[{timestamp}] {msg.author.display_name}: {msg.content}"
-    # 添付ファイル名も記録
     if msg.attachments:
         files = ", ".join(a.filename for a in msg.attachments)
         text += f" [添付: {files}]"
@@ -90,7 +204,6 @@ def format_message(msg: discord.Message) -> str:
 
 
 async def load_full_history(channel: discord.TextChannel) -> list[str]:
-    """チャンネルの全履歴を取得する。"""
     messages = []
     count = 0
     try:
@@ -110,14 +223,11 @@ async def load_full_history(channel: discord.TextChannel) -> list[str]:
 
 
 async def update_priority_cache(channel: discord.TextChannel):
-    """優先チャンネルのキャッシュを差分更新する。"""
     if channel.id not in priority_cache:
         return
-
     last_id = priority_cache_last_id.get(channel.id)
     if not last_id:
         return
-
     new_messages = []
     try:
         after = discord.Object(id=last_id)
@@ -129,7 +239,6 @@ async def update_priority_cache(channel: discord.TextChannel):
     except Exception:
         logger.exception("キャッシュ差分更新に失敗: #%s", channel.name)
         return
-
     if new_messages:
         priority_cache[channel.id].extend(new_messages)
         priority_cache_last_id[channel.id] = last_id
@@ -138,7 +247,6 @@ async def update_priority_cache(channel: discord.TextChannel):
 
 
 async def fetch_channel_history(channel: discord.TextChannel, limit: int = 200) -> list[str]:
-    """通常チャンネルの最近のメッセージ履歴を取得する。"""
     messages = []
     after = datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)
     try:
@@ -155,16 +263,12 @@ async def fetch_channel_history(channel: discord.TextChannel, limit: int = 200) 
 
 
 async def fetch_server_context(guild: discord.Guild) -> str:
-    """サーバー内のテキストチャンネルからメッセージ履歴を収集する。"""
     all_history = []
-
     for channel in guild.text_channels:
         permissions = channel.permissions_for(guild.me)
         if not permissions.read_messages or not permissions.read_message_history:
             continue
-
         if is_priority_channel(channel):
-            # 優先チャンネル: キャッシュを差分更新して全履歴を使う
             await update_priority_cache(channel)
             history = priority_cache.get(channel.id, [])
             if history:
@@ -172,22 +276,20 @@ async def fetch_server_context(guild: discord.Guild) -> str:
                 all_history.extend(history)
                 all_history.append("")
         else:
-            # 通常チャンネル: 最近の履歴のみ
             history = await fetch_channel_history(channel, limit=HISTORY_FETCH_LIMIT)
             if history:
                 all_history.append(f"=== #{channel.name} ===")
                 all_history.extend(history)
                 all_history.append("")
-
     return "\n".join(all_history)
 
 
 async def generate_answer(question: str, server_context: str) -> str:
-    """サーバーの履歴をコンテキストとして、Claude API で回答を生成する。"""
+    """Agentic loop: Claude can call GitHub tools to fetch repo info."""
     system = f"""{SYSTEM_PROMPT}
 
 ## 回答の優先順位
-1. **最優先: GitHubリポジトリの情報** — ファームウェアの仕様・設定・コードに関する質問は、GitHub上のソースコード・README・設定ファイルの内容を根拠に回答してください。
+1. **最優先: GitHubリポジトリの情報** — ファームウェアの仕様・設定・コードに関する質問は、GitHubツールを使ってリポジトリ（{GITHUB_REPO}@{GITHUB_BRANCH}）のソースコード・README・設定ファイルを取得し、その内容を根拠に回答してください。積極的にツールを使ってください。
 2. **補足: Discordサーバーの履歴** — 過去のやり取りやトラブルシューティングの実例として参照してください。
 3. **一般知識** — 上記に該当しない場合のみ、一般的な知識で回答してください。
 
@@ -198,16 +300,42 @@ async def generate_answer(question: str, server_context: str) -> str:
 {server_context}
 --- 履歴ここまで ---"""
 
-    response = claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=2048,
-        system=system,
-        messages=[{"role": "user", "content": question}],
-        tools=[ADVISOR_TOOL],
-        extra_headers=ADVISOR_HEADERS,
-    )
-    logger.info("Claude応答: stop_reason=%s, blocks=%d",
-                response.stop_reason, len(response.content))
+    all_tools = GITHUB_TOOLS + [ADVISOR_TOOL]
+    messages = [{"role": "user", "content": question}]
+    max_iterations = 8
+
+    for i in range(max_iterations):
+        response = claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2048,
+            system=system,
+            messages=messages,
+            tools=all_tools,
+            extra_headers=ADVISOR_HEADERS,
+        )
+        logger.info("Claude応答 [iter=%d]: stop_reason=%s, blocks=%d",
+                    i, response.stop_reason, len(response.content))
+
+        if response.stop_reason != "tool_use":
+            return "".join(
+                block.text for block in response.content if hasattr(block, "text")
+            )
+
+        # Process tool calls
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                result = handle_tool_call(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    # Fallback if max iterations reached
     return "".join(
         block.text for block in response.content if hasattr(block, "text")
     )
@@ -221,7 +349,6 @@ async def on_ready():
     else:
         logger.warning("TARGET_CHANNEL_IDS が未設定です。すべてのチャンネルで応答します。")
 
-    # 起動時に優先チャンネルの全履歴を事前読み込み
     logger.info("優先チャンネルの全履歴を読み込み中...")
     for guild in bot.guilds:
         for channel in guild.text_channels:
@@ -233,7 +360,6 @@ async def on_ready():
                 logger.info("  #%s の全履歴を取得開始...", channel.name)
                 history = await load_full_history(channel)
                 priority_cache[channel.id] = history
-                # 最後のメッセージIDを記録
                 try:
                     async for msg in channel.history(limit=1):
                         priority_cache_last_id[channel.id] = msg.id
@@ -247,11 +373,8 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # 自分自身のメッセージは無視
     if message.author == bot.user:
         return
-
-    # Botのメッセージは無視
     if message.author.bot:
         return
 
@@ -259,17 +382,11 @@ async def on_message(message: discord.Message):
                 getattr(message.channel, 'name', '?'), message.channel.id,
                 message.author.name, message.content[:80])
 
-    # チャンネルフィルタ (未設定なら全チャンネル対象)
     if TARGET_CHANNEL_IDS and message.channel.id not in TARGET_CHANNEL_IDS:
-        logger.info("  -> チャンネル対象外 (監視: %s)", TARGET_CHANNEL_IDS)
         return
 
-    logger.info(
-        "応答開始 [#%s] %s: %s",
-        message.channel.name,
-        message.author.name,
-        message.content[:80],
-    )
+    logger.info("応答開始 [#%s] %s: %s",
+                message.channel.name, message.author.name, message.content[:80])
 
     async with message.channel.typing():
         try:
@@ -281,7 +398,6 @@ async def on_message(message: discord.Message):
             await message.reply("申し訳ありません。回答の生成中にエラーが発生しました。")
             return
 
-    # 2000文字制限の対応
     if len(answer) > 2000:
         for i in range(0, len(answer), 2000):
             await message.reply(answer[i : i + 2000])
