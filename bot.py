@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import base64
 from datetime import datetime, timedelta, timezone
@@ -310,12 +311,59 @@ def notion_get_page(page_id: str) -> str:
     return content if content else "(ページの内容が空です)"
 
 
+# --- Studio Guide Site Tool ---
+STUDIO_BASE_URL = "https://studio.plotoftheprototype.com"
+STUDIO_TOOLS = [
+    {
+        "name": "fetch_studio_guide",
+        "description": "Studio (plotoftheprototype.com) の公式ガイド・FW更新情報サイトからページを取得する。Notion ユーザーガイドと同等の最優先ソース。FWの最新版・ダウンロード・使い方の情報源。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "取得するパス（例: ''=トップ, 'firmware'=FW更新ページ, その他のサブページ）",
+                    "default": "",
+                }
+            },
+        },
+    },
+]
+
+
+def fetch_studio_guide(path: str = "") -> str:
+    url = f"{STUDIO_BASE_URL}/{path.lstrip('/')}"
+    try:
+        resp = _http.get(url, follow_redirects=True)
+    except Exception as e:
+        return f"Error: {e}"
+    if resp.status_code != 200:
+        return f"Error: {resp.status_code} for {url}"
+    html = resp.text
+    html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", "\n", html)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&lt;", "<", text)
+    text = re.sub(r"&gt;", ">", text)
+    text = re.sub(r"&quot;", '"', text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    text = "\n".join(lines)
+    if len(text) > 8000:
+        text = text[:8000] + f"\n\n... (truncated, total {len(text)} chars)"
+    return f"URL: {url}\n\n{text}" if text else f"(空のページ: {url})"
+
+
 def handle_tool_call(name: str, input_data: dict) -> str:
     logger.info("Tool call: %s(%s)", name, input_data)
     if name == "search_notion":
         return notion_search(input_data["query"])
     elif name == "get_notion_page":
         return notion_get_page(input_data["page_id"])
+    elif name == "fetch_studio_guide":
+        return fetch_studio_guide(input_data.get("path", ""))
     elif name == "get_repo_tree":
         return github_get_tree(input_data.get("path", ""))
     elif name == "get_file_contents":
@@ -457,26 +505,30 @@ async def generate_answer(question: str, server_context: str) -> str:
     system = f"""{SYSTEM_PROMPT}
 
 ## 回答の優先順位（厳守）
-1. **最優先: Notionユーザーガイド** — 質問を受けたら、まずsearch_notionで関連ページを検索し、get_notion_pageで内容を取得してください。ユーザーガイドに書かれている情報を最も信頼できるソースとして回答してください。必ず最初にNotionを検索してください。
-2. **第2優先: Discordサーバーの履歴** — ユーザーガイドに情報がない場合、過去のやり取りやトラブルシューティングの実例を参照してください。特に「トラブルシューティング」チャンネルには過去の全履歴が含まれています。
+1. **最優先（同列）: Notionユーザーガイド と Studio公式サイト** — どちらも公式情報源。質問の内容に応じて以下のツールで取得してください:
+   - `search_notion` → `get_notion_page`: Notionに書かれた詳細ガイド
+   - `fetch_studio_guide`: Studioサイト（{STUDIO_BASE_URL}）。FW更新・ダウンロード・基本ガイドはここを最初に確認
+   - 関連する話題なら **両方を確認** して総合的に回答してください。
+2. **第2優先: Discordサーバーの履歴** — 公式情報になければ、過去のやり取りやトラブルシューティングの実例を参照してください。特に「トラブルシューティング」チャンネルには過去の全履歴が含まれています。
 3. **第3優先: GitHubリポジトリ** — 上記で十分な情報が得られない場合のみ、GitHubツールを使ってリポジトリ（{GITHUB_REPO}@{GITHUB_BRANCH}）のソースコード・設定ファイルを参照してください。
 4. **一般知識** — 上記すべてに該当しない場合のみ、一般的な知識で回答してください。
 
 ## 重要
-- Notionのユーザーガイドが公式ドキュメントです。GitHubのコードと矛盾する場合はNotionを優先してください。
+- 公式情報源（Notion / Studioサイト）が最も信頼できます。GitHubのコードと矛盾する場合は公式を優先してください。
 - 回答にはどのソースを根拠にしたか明記してください。
 
 ## ファームウェア（FW）の更新情報・ダウンロードについて
 - FWの最新版・更新情報・ダウンロード方法に関する質問を受けたら、必ず以下のURLを案内してください:
-  https://studio.plotoftheprototype.com/firmware
+  {STUDIO_BASE_URL}/firmware
 - 「FW更新したい」「最新FWはどこ？」「ダウンロード先を教えて」などの問い合わせはこのページに誘導してください。
+- 必要なら `fetch_studio_guide(path="firmware")` で最新版の内容を取得してから回答してください。
 
 ## Discordサーバー履歴
 --- サーバー履歴 ---
 {server_context}
 --- 履歴ここまで ---"""
 
-    all_tools = NOTION_TOOLS + GITHUB_TOOLS + [ADVISOR_TOOL]
+    all_tools = NOTION_TOOLS + STUDIO_TOOLS + GITHUB_TOOLS + [ADVISOR_TOOL]
     messages = [{"role": "user", "content": question}]
     max_iterations = 8
 
