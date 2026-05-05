@@ -466,6 +466,11 @@ async def generate_answer(question: str, server_context: str) -> str:
 - Notionのユーザーガイドが公式ドキュメントです。GitHubのコードと矛盾する場合はNotionを優先してください。
 - 回答にはどのソースを根拠にしたか明記してください。
 
+## ファームウェア（FW）の更新情報・ダウンロードについて
+- FWの最新版・更新情報・ダウンロード方法に関する質問を受けたら、必ず以下のURLを案内してください:
+  https://studio.plotoftheprototype.com/firmware
+- 「FW更新したい」「最新FWはどこ？」「ダウンロード先を教えて」などの問い合わせはこのページに誘導してください。
+
 ## Discordサーバー履歴
 --- サーバー履歴 ---
 {server_context}
