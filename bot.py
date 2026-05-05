@@ -34,6 +34,9 @@ SYSTEM_PROMPT = os.environ.get(
 HISTORY_FETCH_LIMIT = int(os.environ.get("HISTORY_FETCH_LIMIT", "200"))
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "30"))
 
+# Notion settings
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+
 # GitHub settings
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "pite1222/conductor")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "zephyr-4.1")
@@ -161,9 +164,159 @@ def github_search_code(query: str) -> str:
     return f"Found {data['total_count']} files:\n" + "\n".join(results)
 
 
+# --- Notion Tools ---
+NOTION_TOOLS = [
+    {
+        "name": "search_notion",
+        "description": "Notionのユーザーガイドを検索する。キーワードでページを探し、タイトルとIDを返す。回答の最優先ソース。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "検索キーワード（例: 'キーマップ', 'LED設定', 'トラブルシューティング'）",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_notion_page",
+        "description": "Notionページの内容を取得する。search_notionで見つけたページIDを指定して詳細を読む。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "page_id": {
+                    "type": "string",
+                    "description": "NotionページのID（search_notionの結果から取得）",
+                }
+            },
+            "required": ["page_id"],
+        },
+    },
+]
+
+
+# --- Notion API helpers ---
+def _notion_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+
+
+def _extract_rich_text(rich_text_array: list) -> str:
+    return "".join(rt.get("plain_text", "") for rt in rich_text_array)
+
+
+def _blocks_to_text(blocks: list) -> str:
+    lines = []
+    for block in blocks:
+        btype = block.get("type", "")
+        data = block.get(btype, {})
+        text = ""
+        if btype in ("paragraph", "bulleted_list_item", "numbered_list_item", "to_do", "toggle", "quote", "callout"):
+            text = _extract_rich_text(data.get("rich_text", []))
+        elif btype.startswith("heading_"):
+            text = _extract_rich_text(data.get("rich_text", []))
+            level = btype[-1]
+            text = "#" * int(level) + " " + text
+        elif btype == "code":
+            code = _extract_rich_text(data.get("rich_text", []))
+            lang = data.get("language", "")
+            text = f"```{lang}\n{code}\n```"
+        elif btype == "divider":
+            text = "---"
+        elif btype == "table_row":
+            cells = data.get("cells", [])
+            text = " | ".join(_extract_rich_text(cell) for cell in cells)
+
+        prefix = ""
+        if btype == "bulleted_list_item":
+            prefix = "- "
+        elif btype == "numbered_list_item":
+            prefix = "1. "
+        elif btype == "to_do":
+            checked = "x" if data.get("checked") else " "
+            prefix = f"[{checked}] "
+
+        if text:
+            lines.append(prefix + text)
+    return "\n".join(lines)
+
+
+def notion_search(query: str) -> str:
+    if not NOTION_TOKEN:
+        return "Error: NOTION_TOKEN が設定されていません"
+    url = "https://api.notion.com/v1/search"
+    body = {"query": query, "page_size": 10}
+    resp = _http.post(url, headers=_notion_headers(), json=body)
+    if resp.status_code != 200:
+        return f"Error: {resp.status_code} {resp.text[:200]}"
+    data = resp.json()
+    results = []
+    for item in data.get("results", []):
+        obj_type = item.get("object")
+        item_id = item["id"]
+        title = ""
+        if obj_type == "page":
+            props = item.get("properties", {})
+            for prop in props.values():
+                if prop.get("type") == "title":
+                    title = _extract_rich_text(prop.get("title", []))
+                    break
+            if not title:
+                title = "(無題)"
+        elif obj_type == "database":
+            title = _extract_rich_text(item.get("title", []))
+            title = f"[DB] {title}"
+        results.append(f"- {title} (id: {item_id})")
+    if not results:
+        return f"'{query}' に一致するページが見つかりません"
+    return f"{len(results)}件見つかりました:\n" + "\n".join(results)
+
+
+def notion_get_page(page_id: str) -> str:
+    if not NOTION_TOKEN:
+        return "Error: NOTION_TOKEN が設定されていません"
+    all_blocks = []
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+    params = {"page_size": 100}
+    while True:
+        resp = _http.get(url, headers=_notion_headers(), params=params)
+        if resp.status_code != 200:
+            return f"Error: {resp.status_code} {resp.text[:200]}"
+        data = resp.json()
+        all_blocks.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        params["start_cursor"] = data["next_cursor"]
+
+    # Fetch children for blocks that have them (toggles, etc.)
+    expanded = []
+    for block in all_blocks:
+        expanded.append(block)
+        if block.get("has_children") and block["type"] not in ("child_page", "child_database"):
+            child_url = f"https://api.notion.com/v1/blocks/{block['id']}/children"
+            child_resp = _http.get(child_url, headers=_notion_headers(), params={"page_size": 100})
+            if child_resp.status_code == 200:
+                children = child_resp.json().get("results", [])
+                expanded.extend(children)
+
+    content = _blocks_to_text(expanded)
+    if len(content) > 10000:
+        content = content[:10000] + f"\n\n... (truncated, total {len(content)} chars)"
+    return content if content else "(ページの内容が空です)"
+
+
 def handle_tool_call(name: str, input_data: dict) -> str:
     logger.info("Tool call: %s(%s)", name, input_data)
-    if name == "get_repo_tree":
+    if name == "search_notion":
+        return notion_search(input_data["query"])
+    elif name == "get_notion_page":
+        return notion_get_page(input_data["page_id"])
+    elif name == "get_repo_tree":
         return github_get_tree(input_data.get("path", ""))
     elif name == "get_file_contents":
         return github_get_file(input_data["path"])
@@ -174,9 +327,9 @@ def handle_tool_call(name: str, input_data: dict) -> str:
 
 # --- Claude クライアント ---
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-logger.info("Claude SDK v%s / model=%s / advisor=%s (max_uses=%d) / repo=%s@%s",
+logger.info("Claude SDK v%s / model=%s / advisor=%s (max_uses=%d) / repo=%s@%s / notion=%s",
             anthropic.__version__, CLAUDE_MODEL, ADVISOR_MODEL, ADVISOR_MAX_USES,
-            GITHUB_REPO, GITHUB_BRANCH)
+            GITHUB_REPO, GITHUB_BRANCH, "enabled" if NOTION_TOKEN else "disabled")
 
 # --- Discord ボット ---
 intents = discord.Intents.default()
@@ -303,19 +456,22 @@ async def generate_answer(question: str, server_context: str) -> str:
     """Agentic loop: Claude can call GitHub tools to fetch repo info."""
     system = f"""{SYSTEM_PROMPT}
 
-## 回答の優先順位
-1. **最優先: GitHubリポジトリの情報** — ファームウェアの仕様・設定・コードに関する質問は、GitHubツールを使ってリポジトリ（{GITHUB_REPO}@{GITHUB_BRANCH}）のソースコード・README・設定ファイルを取得し、その内容を根拠に回答してください。積極的にツールを使ってください。
-2. **補足: Discordサーバーの履歴** — 過去のやり取りやトラブルシューティングの実例として参照してください。
-3. **一般知識** — 上記に該当しない場合のみ、一般的な知識で回答してください。
+## 回答の優先順位（厳守）
+1. **最優先: Notionユーザーガイド** — 質問を受けたら、まずsearch_notionで関連ページを検索し、get_notion_pageで内容を取得してください。ユーザーガイドに書かれている情報を最も信頼できるソースとして回答してください。必ず最初にNotionを検索してください。
+2. **第2優先: Discordサーバーの履歴** — ユーザーガイドに情報がない場合、過去のやり取りやトラブルシューティングの実例を参照してください。特に「トラブルシューティング」チャンネルには過去の全履歴が含まれています。
+3. **第3優先: GitHubリポジトリ** — 上記で十分な情報が得られない場合のみ、GitHubツールを使ってリポジトリ（{GITHUB_REPO}@{GITHUB_BRANCH}）のソースコード・設定ファイルを参照してください。
+4. **一般知識** — 上記すべてに該当しない場合のみ、一般的な知識で回答してください。
+
+## 重要
+- Notionのユーザーガイドが公式ドキュメントです。GitHubのコードと矛盾する場合はNotionを優先してください。
+- 回答にはどのソースを根拠にしたか明記してください。
 
 ## Discordサーバー履歴
-特に「トラブルシューティング」チャンネルには過去の全履歴が含まれています。
-
 --- サーバー履歴 ---
 {server_context}
 --- 履歴ここまで ---"""
 
-    all_tools = GITHUB_TOOLS + [ADVISOR_TOOL]
+    all_tools = NOTION_TOOLS + GITHUB_TOOLS + [ADVISOR_TOOL]
     messages = [{"role": "user", "content": question}]
     max_iterations = 8
 
