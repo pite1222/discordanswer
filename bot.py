@@ -105,10 +105,7 @@ GITHUB_TOOLS = [
     },
 ]
 
-# --- GitHub API helpers ---
-_http = httpx.Client(timeout=15)
-
-
+# --- GitHub API helpers (async) ---
 def _github_headers() -> dict:
     headers = {"Accept": "application/vnd.github.v3+json"}
     if GITHUB_TOKEN:
@@ -116,15 +113,15 @@ def _github_headers() -> dict:
     return headers
 
 
-def github_get_tree(path: str = "") -> str:
+async def github_get_tree(path: str = "") -> str:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
     params = {"ref": GITHUB_BRANCH}
-    resp = _http.get(url, headers=_github_headers(), params=params)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=_github_headers(), params=params)
     if resp.status_code != 200:
         return f"Error: {resp.status_code} {resp.text[:200]}"
     items = resp.json()
     if isinstance(items, dict):
-        # Single file, not a directory
         return f"{items['name']} ({items['type']}, {items.get('size', '?')} bytes)"
     lines = []
     for item in items:
@@ -134,26 +131,27 @@ def github_get_tree(path: str = "") -> str:
     return "\n".join(lines)
 
 
-def github_get_file(path: str) -> str:
+async def github_get_file(path: str) -> str:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
     params = {"ref": GITHUB_BRANCH}
-    resp = _http.get(url, headers=_github_headers(), params=params)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=_github_headers(), params=params)
     if resp.status_code != 200:
         return f"Error: {resp.status_code} — file not found or inaccessible"
     data = resp.json()
     if data.get("type") != "file":
         return f"Error: '{path}' is a directory, not a file. Use get_repo_tree instead."
     content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-    # Truncate very large files
     if len(content) > 8000:
         content = content[:8000] + f"\n\n... (truncated, total {len(content)} chars)"
     return content
 
 
-def github_search_code(query: str) -> str:
+async def github_search_code(query: str) -> str:
     url = "https://api.github.com/search/code"
     params = {"q": f"{query} repo:{GITHUB_REPO}"}
-    resp = _http.get(url, headers=_github_headers(), params=params)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=_github_headers(), params=params)
     if resp.status_code != 200:
         return f"Error: {resp.status_code} {resp.text[:200]}"
     data = resp.json()
@@ -198,7 +196,7 @@ NOTION_TOOLS = [
 ]
 
 
-# --- Notion API helpers ---
+# --- Notion API helpers (async) ---
 def _notion_headers() -> dict:
     return {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -247,12 +245,13 @@ def _blocks_to_text(blocks: list) -> str:
     return "\n".join(lines)
 
 
-def notion_search(query: str) -> str:
+async def notion_search(query: str) -> str:
     if not NOTION_TOKEN:
         return "Error: NOTION_TOKEN が設定されていません"
     url = "https://api.notion.com/v1/search"
     body = {"query": query, "page_size": 10}
-    resp = _http.post(url, headers=_notion_headers(), json=body)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, headers=_notion_headers(), json=body)
     if resp.status_code != 200:
         return f"Error: {resp.status_code} {resp.text[:200]}"
     data = resp.json()
@@ -278,32 +277,32 @@ def notion_search(query: str) -> str:
     return f"{len(results)}件見つかりました:\n" + "\n".join(results)
 
 
-def notion_get_page(page_id: str) -> str:
+async def notion_get_page(page_id: str) -> str:
     if not NOTION_TOKEN:
         return "Error: NOTION_TOKEN が設定されていません"
     all_blocks = []
     url = f"https://api.notion.com/v1/blocks/{page_id}/children"
     params = {"page_size": 100}
-    while True:
-        resp = _http.get(url, headers=_notion_headers(), params=params)
-        if resp.status_code != 200:
-            return f"Error: {resp.status_code} {resp.text[:200]}"
-        data = resp.json()
-        all_blocks.extend(data.get("results", []))
-        if not data.get("has_more"):
-            break
-        params["start_cursor"] = data["next_cursor"]
+    async with httpx.AsyncClient(timeout=15) as client:
+        while True:
+            resp = await client.get(url, headers=_notion_headers(), params=params)
+            if resp.status_code != 200:
+                return f"Error: {resp.status_code} {resp.text[:200]}"
+            data = resp.json()
+            all_blocks.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            params["start_cursor"] = data["next_cursor"]
 
-    # Fetch children for blocks that have them (toggles, etc.)
-    expanded = []
-    for block in all_blocks:
-        expanded.append(block)
-        if block.get("has_children") and block["type"] not in ("child_page", "child_database"):
-            child_url = f"https://api.notion.com/v1/blocks/{block['id']}/children"
-            child_resp = _http.get(child_url, headers=_notion_headers(), params={"page_size": 100})
-            if child_resp.status_code == 200:
-                children = child_resp.json().get("results", [])
-                expanded.extend(children)
+        expanded = []
+        for block in all_blocks:
+            expanded.append(block)
+            if block.get("has_children") and block["type"] not in ("child_page", "child_database"):
+                child_url = f"https://api.notion.com/v1/blocks/{block['id']}/children"
+                child_resp = await client.get(child_url, headers=_notion_headers(), params={"page_size": 100})
+                if child_resp.status_code == 200:
+                    children = child_resp.json().get("results", [])
+                    expanded.extend(children)
 
     content = _blocks_to_text(expanded)
     if len(content) > 10000:
@@ -331,10 +330,11 @@ STUDIO_TOOLS = [
 ]
 
 
-def fetch_studio_guide(path: str = "") -> str:
+async def fetch_studio_guide(path: str = "") -> str:
     url = f"{STUDIO_BASE_URL}/{path.lstrip('/')}"
     try:
-        resp = _http.get(url, follow_redirects=True)
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url)
     except Exception as e:
         return f"Error: {e}"
     if resp.status_code != 200:
@@ -356,25 +356,25 @@ def fetch_studio_guide(path: str = "") -> str:
     return f"URL: {url}\n\n{text}" if text else f"(空のページ: {url})"
 
 
-def handle_tool_call(name: str, input_data: dict) -> str:
+async def handle_tool_call(name: str, input_data: dict) -> str:
     logger.info("Tool call: %s(%s)", name, input_data)
     if name == "search_notion":
-        return notion_search(input_data["query"])
+        return await notion_search(input_data["query"])
     elif name == "get_notion_page":
-        return notion_get_page(input_data["page_id"])
+        return await notion_get_page(input_data["page_id"])
     elif name == "fetch_studio_guide":
-        return fetch_studio_guide(input_data.get("path", ""))
+        return await fetch_studio_guide(input_data.get("path", ""))
     elif name == "get_repo_tree":
-        return github_get_tree(input_data.get("path", ""))
+        return await github_get_tree(input_data.get("path", ""))
     elif name == "get_file_contents":
-        return github_get_file(input_data["path"])
+        return await github_get_file(input_data["path"])
     elif name == "search_code":
-        return github_search_code(input_data["query"])
+        return await github_search_code(input_data["query"])
     return f"Unknown tool: {name}"
 
 
-# --- Claude クライアント ---
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# --- Claude クライアント (async) ---
+claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 logger.info("Claude SDK v%s / model=%s / advisor=%s (max_uses=%d) / repo=%s@%s / notion=%s",
             anthropic.__version__, CLAUDE_MODEL, ADVISOR_MODEL, ADVISOR_MAX_USES,
             GITHUB_REPO, GITHUB_BRANCH, "enabled" if NOTION_TOKEN else "disabled")
@@ -469,7 +469,13 @@ MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", "15000"))
 async def fetch_server_context(guild: discord.Guild) -> str:
     all_history = []
     total_chars = 0
-    for channel in guild.text_channels:
+
+    # 優先チャンネルを先に処理してコンテキスト冒頭に確実に含める
+    priority_channels = [ch for ch in guild.text_channels if is_priority_channel(ch)]
+    other_channels = [ch for ch in guild.text_channels if not is_priority_channel(ch)]
+    ordered_channels = priority_channels + other_channels
+
+    for channel in ordered_channels:
         if total_chars >= MAX_CONTEXT_CHARS:
             break
         permissions = channel.permissions_for(guild.me)
@@ -479,7 +485,6 @@ async def fetch_server_context(guild: discord.Guild) -> str:
             await update_priority_cache(channel)
             history = priority_cache.get(channel.id, [])
             if history:
-                # Use only the most recent messages to stay within limits
                 recent = history[-100:]
                 header = f"=== #{channel.name} (最新{len(recent)}件 / 全{len(history)}件) ==="
                 all_history.append(header)
@@ -501,7 +506,7 @@ async def fetch_server_context(guild: discord.Guild) -> str:
 
 
 async def generate_answer(question: str, server_context: str) -> str:
-    """Agentic loop: Claude can call GitHub tools to fetch repo info."""
+    """Agentic loop: Claude can call GitHub/Notion/Studio tools to fetch info."""
     system = f"""{SYSTEM_PROMPT}
 
 ## 回答の優先順位（厳守）
@@ -533,7 +538,7 @@ async def generate_answer(question: str, server_context: str) -> str:
     max_iterations = 8
 
     for i in range(max_iterations):
-        response = claude.messages.create(
+        response = await claude.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=2048,
             system=system,
@@ -549,11 +554,10 @@ async def generate_answer(question: str, server_context: str) -> str:
                 block.text for block in response.content if hasattr(block, "text")
             )
 
-        # Process tool calls
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
-                result = handle_tool_call(block.name, block.input)
+                result = await handle_tool_call(block.name, block.input)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -563,7 +567,6 @@ async def generate_answer(question: str, server_context: str) -> str:
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results})
 
-    # Fallback if max iterations reached
     return "".join(
         block.text for block in response.content if hasattr(block, "text")
     )
