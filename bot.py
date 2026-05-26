@@ -452,6 +452,7 @@ bot = discord.Client(intents=intents)
 priority_cache: dict[int, list[str]] = {}
 priority_cache_last_id: dict[int, int] = {}
 corrections_cache: list[dict] = []
+studio_guide_cache: str = ""
 
 
 def is_priority_channel(channel: discord.TextChannel) -> bool:
@@ -607,6 +608,11 @@ async def generate_answer(question: str, server_context: str) -> str:
 - 「FW更新したい」「最新FWはどこ？」「ダウンロード先を教えて」などの問い合わせはこのページに誘導してください。
 - 必要なら `fetch_studio_guide(path="firmware")` で最新版の内容を取得してから回答してください。
 
+## Studio公式ガイド（常に参照すること）
+--- Studio Guide ({STUDIO_BASE_URL}/guide) ---
+{studio_guide_cache}
+--- ガイドここまで ---
+
 ## Discordサーバー履歴
 --- サーバー履歴 ---
 {server_context}
@@ -679,8 +685,12 @@ async def on_ready():
     logger.info("優先チャンネルの読み込み完了 (合計 %d件)",
                 sum(len(v) for v in priority_cache.values()))
 
-    global corrections_cache
+    global corrections_cache, studio_guide_cache
     corrections_cache = await load_corrections()
+
+    logger.info("Studio ガイドページを取得中...")
+    studio_guide_cache = await fetch_studio_guide("guide")
+    logger.info("Studio ガイド取得完了 (%d文字)", len(studio_guide_cache))
 
     logger.info("ボット準備完了！")
 
