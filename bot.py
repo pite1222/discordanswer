@@ -37,6 +37,7 @@ HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "30"))
 
 # Notion settings
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+NOTION_CORRECTIONS_DB_ID = os.environ.get("NOTION_CORRECTIONS_DB_ID", "")
 
 # GitHub settings
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "pite1222/conductor")
@@ -310,6 +311,68 @@ async def notion_get_page(page_id: str) -> str:
     return content if content else "(ページの内容が空です)"
 
 
+# --- Corrections (訂正ナレッジ) ---
+def _extract_topic(text: str) -> str:
+    for sep in ("。", "、", "\n", ". ", ", "):
+        idx = text.find(sep)
+        if idx > 0:
+            return text[:idx]
+    return text[:50]
+
+
+async def load_corrections() -> list[dict]:
+    if not NOTION_TOKEN or not NOTION_CORRECTIONS_DB_ID:
+        return []
+    url = f"https://api.notion.com/v1/databases/{NOTION_CORRECTIONS_DB_ID}/query"
+    body: dict = {"page_size": 100}
+    results = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        while True:
+            resp = await client.post(url, headers=_notion_headers(), json=body)
+            if resp.status_code != 200:
+                logger.error("訂正DB読み込み失敗: %d %s", resp.status_code, resp.text[:200])
+                break
+            data = resp.json()
+            for page in data.get("results", []):
+                props = page.get("properties", {})
+                topic = _extract_rich_text(props.get("Topic", {}).get("title", []))
+                correction = _extract_rich_text(props.get("Correction", {}).get("rich_text", []))
+                question = _extract_rich_text(props.get("Question", {}).get("rich_text", []))
+                if correction:
+                    results.append({
+                        "topic": topic,
+                        "correction": correction,
+                        "question": question,
+                    })
+            if not data.get("has_more"):
+                break
+            body["start_cursor"] = data["next_cursor"]
+    logger.info("訂正データ %d件 読み込み完了", len(results))
+    return results
+
+
+async def save_correction(topic: str, correction: str, question: str, wrong_answer: str) -> bool:
+    if not NOTION_TOKEN or not NOTION_CORRECTIONS_DB_ID:
+        return False
+    url = "https://api.notion.com/v1/pages"
+    body = {
+        "parent": {"database_id": NOTION_CORRECTIONS_DB_ID},
+        "properties": {
+            "Topic": {"title": [{"text": {"content": topic[:200]}}]},
+            "Correction": {"rich_text": [{"text": {"content": correction[:2000]}}]},
+            "Question": {"rich_text": [{"text": {"content": question[:2000]}}]},
+            "WrongAnswer": {"rich_text": [{"text": {"content": wrong_answer[:2000]}}]},
+        },
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, headers=_notion_headers(), json=body)
+    if resp.status_code != 200:
+        logger.error("訂正保存失敗: %d %s", resp.status_code, resp.text[:200])
+        return False
+    logger.info("訂正保存完了: topic=%s", topic)
+    return True
+
+
 # --- Studio Guide Site Tool ---
 STUDIO_BASE_URL = "https://studio.plotoftheprototype.com"
 STUDIO_TOOLS = [
@@ -388,6 +451,7 @@ bot = discord.Client(intents=intents)
 # --- 優先チャンネルの全履歴キャッシュ ---
 priority_cache: dict[int, list[str]] = {}
 priority_cache_last_id: dict[int, int] = {}
+corrections_cache: list[dict] = []
 
 
 def is_priority_channel(channel: discord.TextChannel) -> bool:
@@ -507,8 +571,23 @@ async def fetch_server_context(guild: discord.Guild) -> str:
 
 async def generate_answer(question: str, server_context: str) -> str:
     """Agentic loop: Claude can call GitHub/Notion/Studio tools to fetch info."""
-    system = f"""{SYSTEM_PROMPT}
+    corrections_block = ""
+    if corrections_cache:
+        lines = []
+        for c in corrections_cache:
+            entry = f"- **{c['topic']}**: {c['correction']}"
+            if c.get("question"):
+                entry += f"（元の質問: {c['question'][:100]}）"
+            lines.append(entry)
+        corrections_block = (
+            "\n## 訂正済み情報（最優先 — 他のすべてのソースより優先）\n"
+            "以下はサーバーオーナーが訂正した正確な情報です。これらのトピックに関する質問には必ずこの訂正内容に基づいて回答してください。\n\n"
+            + "\n".join(lines)
+            + "\n"
+        )
 
+    system = f"""{SYSTEM_PROMPT}
+{corrections_block}
 ## 回答の優先順位（厳守）
 1. **最優先（同列）: Notionユーザーガイド と Studio公式サイト** — どちらも公式情報源。質問の内容に応じて以下のツールで取得してください:
    - `search_notion` → `get_notion_page`: Notionに書かれた詳細ガイド
@@ -599,6 +678,10 @@ async def on_ready():
                     pass
     logger.info("優先チャンネルの読み込み完了 (合計 %d件)",
                 sum(len(v) for v in priority_cache.values()))
+
+    global corrections_cache
+    corrections_cache = await load_corrections()
+
     logger.info("ボット準備完了！")
 
 
@@ -612,6 +695,57 @@ async def on_message(message: discord.Message):
     logger.info("MSG [#%s] ch_id=%s %s: %s",
                 getattr(message.channel, 'name', '?'), message.channel.id,
                 message.author.name, message.content[:80])
+
+    if message.content.startswith("!訂正"):
+        if message.author.id != message.guild.owner_id:
+            await message.reply("このコマンドはサーバーオーナーのみ使用できます。")
+            return
+
+        correction_text = message.content[len("!訂正"):].strip()
+        if not correction_text:
+            await message.reply("使い方: ボットの誤回答に返信して `!訂正 正しい情報` と送信してください。")
+            return
+
+        if not message.reference:
+            await message.reply("ボットの回答メッセージに返信する形で使ってください。")
+            return
+
+        try:
+            bot_msg = await message.channel.fetch_message(message.reference.message_id)
+        except discord.NotFound:
+            await message.reply("返信先のメッセージが見つかりません。")
+            return
+
+        if bot_msg.author != bot.user:
+            await message.reply("ボットの回答メッセージに返信してください。")
+            return
+
+        original_question = ""
+        if bot_msg.reference:
+            try:
+                orig_msg = await message.channel.fetch_message(bot_msg.reference.message_id)
+                original_question = orig_msg.content
+            except Exception:
+                pass
+
+        topic = _extract_topic(correction_text)
+        success = await save_correction(
+            topic=topic,
+            correction=correction_text,
+            question=original_question,
+            wrong_answer=bot_msg.content[:2000],
+        )
+
+        if success:
+            global corrections_cache
+            corrections_cache = await load_corrections()
+            await message.reply(
+                f"訂正を記録しました。今後「{topic}」に関する質問ではこの情報を優先します。"
+                f"（現在の訂正データ: {len(corrections_cache)}件）"
+            )
+        else:
+            await message.reply("訂正の保存に失敗しました。Notion設定を確認してください。")
+        return
 
     if TARGET_CHANNEL_IDS and message.channel.id not in TARGET_CHANNEL_IDS:
         return
