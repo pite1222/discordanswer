@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import logging
@@ -371,6 +372,50 @@ async def save_correction(topic: str, correction: str, question: str, wrong_answ
         return False
     logger.info("訂正保存完了: topic=%s", topic)
     return True
+
+
+async def extract_knowledge(history: list[str], existing_topics: list[str]) -> list[dict]:
+    history_text = "\n".join(history[-300:])
+    existing_str = "\n".join(f"- {t}" for t in existing_topics) if existing_topics else "(なし)"
+
+    prompt = f"""以下はDiscordの「トラブルシューティング」チャンネルの履歴です。
+ここから、conductorキーボードに関する有用なナレッジを抽出してください。
+
+## 抽出ルール
+- 実際に解決に至った具体的な情報のみ
+- conductorキーボード固有の知識（一般的なPC知識は除外）
+- 質問→回答のペアから、回答部分を簡潔にまとめる
+- 1件のナレッジは1トピックに集中
+
+## 既に登録済みのトピック（重複を避けること）
+{existing_str}
+
+## 出力形式
+JSON配列で返してください。他のテキストは不要です。
+```json
+[
+  {{"topic": "トピック名（短く）", "correction": "正確な情報・解決方法", "question": "元の質問の要約"}},
+  ...
+]
+```
+
+## チャンネル履歴
+{history_text}"""
+
+    response = await claude.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = "".join(block.text for block in response.content if hasattr(block, "text"))
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if not match:
+        return []
+    try:
+        return json.loads(match.group())
+    except json.JSONDecodeError:
+        logger.error("ナレッジ抽出のJSON解析に失敗")
+        return []
 
 
 # --- Studio Guide Site Tool ---
@@ -755,6 +800,51 @@ async def on_message(message: discord.Message):
             )
         else:
             await message.reply("訂正の保存に失敗しました。Notion設定を確認してください。")
+        return
+
+    if message.content.startswith("!ナレッジ抽出"):
+        if message.author.id != message.guild.owner_id:
+            await message.reply("このコマンドはサーバーオーナーのみ使用できます。")
+            return
+
+        all_history = []
+        for ch_id, history in priority_cache.items():
+            all_history.extend(history)
+
+        if not all_history:
+            await message.reply("トラブルシューティングチャンネルの履歴がありません。")
+            return
+
+        existing_topics = [c["topic"] for c in corrections_cache]
+        await message.reply(f"ナレッジ抽出を開始します（履歴 {len(all_history)}件を分析中...）")
+
+        async with message.channel.typing():
+            knowledge = await extract_knowledge(all_history, existing_topics)
+
+        if not knowledge:
+            await message.reply("抽出できるナレッジが見つかりませんでした。")
+            return
+
+        saved = 0
+        for item in knowledge:
+            success = await save_correction(
+                topic=item.get("topic", "")[:200],
+                correction=item.get("correction", ""),
+                question=item.get("question", ""),
+                wrong_answer="",
+            )
+            if success:
+                saved += 1
+
+        global corrections_cache
+        corrections_cache = await load_corrections()
+
+        topics_list = "\n".join(f"- {item.get('topic', '')}" for item in knowledge[:10])
+        await message.reply(
+            f"ナレッジ抽出完了: {len(knowledge)}件抽出、{saved}件保存\n"
+            f"（現在の訂正データ: {len(corrections_cache)}件）\n\n"
+            f"**抽出されたトピック:**\n{topics_list}"
+        )
         return
 
     if TARGET_CHANNEL_IDS and message.channel.id not in TARGET_CHANNEL_IDS:
