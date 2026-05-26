@@ -794,10 +794,15 @@ async def on_message(message: discord.Message):
         if success:
             global corrections_cache
             corrections_cache = await load_corrections()
-            await message.reply(
-                f"訂正を記録しました。今後「{topic}」に関する質問ではこの情報を優先します。"
-                f"（現在の訂正データ: {len(corrections_cache)}件）"
-            )
+            reply_lines = [
+                "✅ 訂正を記録しました。\n",
+                f"**トピック:** {topic}",
+                f"**訂正内容:** {correction_text[:500]}",
+            ]
+            if original_question:
+                reply_lines.append(f"**元の質問:** {original_question[:200]}")
+            reply_lines.append(f"\n今後このトピックに関する質問ではこの情報を優先します。（訂正データ: {len(corrections_cache)}件）")
+            await message.reply("\n".join(reply_lines))
         else:
             await message.reply("訂正の保存に失敗しました。Notion設定を確認してください。")
         return
