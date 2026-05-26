@@ -742,6 +742,7 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
+    global corrections_cache
     if message.author == bot.user:
         return
     if message.author.bot:
@@ -792,7 +793,6 @@ async def on_message(message: discord.Message):
         )
 
         if success:
-            global corrections_cache
             corrections_cache = await load_corrections()
             reply_lines = [
                 "✅ 訂正を記録しました。\n",
@@ -841,7 +841,6 @@ async def on_message(message: discord.Message):
             if success:
                 saved += 1
 
-        global corrections_cache
         corrections_cache = await load_corrections()
 
         topics_list = "\n".join(f"- {item.get('topic', '')}" for item in knowledge[:10])
