@@ -35,6 +35,9 @@ SYSTEM_PROMPT = os.environ.get(
 )
 HISTORY_FETCH_LIMIT = int(os.environ.get("HISTORY_FETCH_LIMIT", "200"))
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "30"))
+CONVERSATION_CONTEXT_LIMIT = int(os.environ.get("CONVERSATION_CONTEXT_LIMIT", "20"))
+CONVERSATION_CONTEXT_MINUTES = int(os.environ.get("CONVERSATION_CONTEXT_MINUTES", "180"))
+MAX_CONVERSATION_CONTEXT_CHARS = int(os.environ.get("MAX_CONVERSATION_CONTEXT_CHARS", "6000"))
 
 # Notion settings
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
@@ -313,6 +316,25 @@ async def notion_get_page(page_id: str) -> str:
 
 
 # --- Corrections (訂正ナレッジ) ---
+BUILTIN_CORRECTIONS = [
+    {
+        "topic": "リセット後のUF2コピーで容量不足やStudio未認識になる",
+        "correction": (
+            "リセットモードでR/LそれぞれのファームウェアUF2をコピーするときに容量不足が出る、"
+            "電源Off/Onしないと接続されない、Conductor Studioでファームウェアバージョンが表示されない場合は、"
+            "macOS側で作られる.DS_Storeなどの隠しファイルや、古いUF2ファイルがドライブ容量を圧迫している可能性が高いです。"
+            "対処は、ブートローダーモードに入った後Finderでドライブを開き、Cmd+Shift+.で隠しファイルを表示して不要ファイルを削除してからUF2をコピーするか、"
+            "ターミナルから `cp ~/Downloads/monokey_R-rgbled_adapter-xiao_ble-zmk.uf2 /Volumes/XIAO-SENSE/` のように直接コピーします。"
+            "Mac固有の状態が原因の可能性があるため、別のPCで試すと切り分けしやすいです。"
+        ),
+        "question": (
+            "リセットファイルとR/Lのファームウェアを入れたが容量不足が出て、電源Off/Onしないと接続されず、"
+            "Conductor Studioでファームウェアバージョンが表示されない"
+        ),
+    }
+]
+
+
 def _extract_topic(text: str) -> str:
     for sep in ("。", "、", "\n", ". ", ", "):
         idx = text.find(sep)
@@ -322,11 +344,11 @@ def _extract_topic(text: str) -> str:
 
 
 async def load_corrections() -> list[dict]:
+    results = [dict(item) for item in BUILTIN_CORRECTIONS]
     if not NOTION_TOKEN or not NOTION_CORRECTIONS_DB_ID:
-        return []
+        return results
     url = f"https://api.notion.com/v1/databases/{NOTION_CORRECTIONS_DB_ID}/query"
     body: dict = {"page_size": 100}
-    results = []
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
             resp = await client.post(url, headers=_notion_headers(), json=body)
@@ -384,7 +406,8 @@ async def extract_knowledge(history: list[str], existing_topics: list[str]) -> l
 ## 抽出ルール
 - 実際に解決に至った具体的な情報のみ
 - conductorキーボード固有の知識（一般的なPC知識は除外）
-- 質問→回答のペアから、回答部分を簡潔にまとめる
+- 単発の質問→回答だけで判断せず、前後のメッセージ、追加質問、試した結果、最終的な解決報告まで含めて判断する
+- 回答部分だけでなく、症状・試行錯誤・最終的に有効だった対処を簡潔にまとめる
 - 1件のナレッジは1トピックに集中
 
 ## 既に登録済みのトピック（重複を避けること）
@@ -505,13 +528,70 @@ def is_priority_channel(channel: discord.TextChannel) -> bool:
     return any(keyword in name for keyword in PRIORITY_CHANNEL_NAMES)
 
 
-def format_message(msg: discord.Message) -> str:
+def format_message(msg: discord.Message, *, current: bool = False) -> str:
     timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
-    text = f"[{timestamp}] {msg.author.display_name}: {msg.content}"
+    author = getattr(msg.author, "display_name", msg.author.name)
+    if msg.author.bot:
+        author += " (bot)"
+    marker = " <今回の発言>" if current else ""
+    text = f"[{timestamp}] {author}{marker}: {msg.content}"
     if msg.attachments:
         files = ", ".join(a.filename for a in msg.attachments)
         text += f" [添付: {files}]"
     return text
+
+
+def trim_context(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return "... (前略)\n" + text[-max_chars:]
+
+
+async def fetch_referenced_message(message: discord.Message) -> discord.Message | None:
+    if not message.reference or not message.reference.message_id:
+        return None
+    resolved = getattr(message.reference, "resolved", None)
+    if isinstance(resolved, discord.Message):
+        return resolved
+    try:
+        return await message.channel.fetch_message(message.reference.message_id)
+    except (discord.Forbidden, discord.NotFound):
+        return None
+    except Exception:
+        logger.exception("返信先メッセージの取得に失敗: #%s", getattr(message.channel, "name", "?"))
+        return None
+
+
+async def fetch_conversation_context(message: discord.Message) -> str:
+    channel = message.channel
+    after = message.created_at - timedelta(minutes=CONVERSATION_CONTEXT_MINUTES)
+    recent_messages = []
+
+    try:
+        async for msg in channel.history(
+            limit=CONVERSATION_CONTEXT_LIMIT,
+            after=after,
+            before=message.created_at,
+            oldest_first=False,
+        ):
+            recent_messages.append(msg)
+    except discord.Forbidden:
+        logger.warning("チャンネル #%s の直近会話取得権限がありません", getattr(channel, "name", "?"))
+    except Exception:
+        logger.exception("チャンネル #%s の直近会話取得に失敗", getattr(channel, "name", "?"))
+
+    recent_messages.reverse()
+    referenced_message = await fetch_referenced_message(message)
+
+    lines = [f"=== 現在のチャンネル: #{getattr(channel, 'name', '?')} ==="]
+    if referenced_message and referenced_message.id not in {msg.id for msg in recent_messages}:
+        lines.extend(["", "=== 返信先メッセージ ===", format_message(referenced_message)])
+
+    lines.extend(["", "=== 直近の会話 ==="])
+    lines.extend(format_message(msg) for msg in recent_messages)
+    lines.append(format_message(message, current=True))
+
+    return trim_context("\n".join(lines), MAX_CONVERSATION_CONTEXT_CHARS)
 
 
 async def load_full_history(channel: discord.TextChannel) -> list[str]:
@@ -615,7 +695,7 @@ async def fetch_server_context(guild: discord.Guild) -> str:
     return result
 
 
-async def generate_answer(question: str, server_context: str) -> str:
+async def generate_answer(question: str, conversation_context: str, server_context: str) -> str:
     """Agentic loop: Claude can call GitHub/Notion/Studio tools to fetch info."""
     corrections_block = ""
     if corrections_cache:
@@ -646,6 +726,10 @@ async def generate_answer(question: str, server_context: str) -> str:
 ## 重要
 - 公式情報源（Notion / Studioサイト）が最も信頼できます。GitHubのコードと矛盾する場合は公式を優先してください。
 - 回答にはどのソースを根拠にしたか明記してください。
+- 質問文だけを孤立して読まず、現在のDiscord会話文脈を最優先で解釈してください。
+- 「それ」「同じです」「試しました」などの続きの発言は、返信先・直前の会話から主語や未解決点を補って返答してください。
+- 直前の回答を繰り返さず、会話が進むように次に確認・実行すべきことを具体的に返してください。
+- 文脈を見ても判断できない場合は、断定せずに必要な確認事項を1つか2つだけ聞いてください。
 
 ## ファームウェア（FW）の更新情報・ダウンロードについて
 - FWの最新版・更新情報・ダウンロード方法に関する質問を受けたら、必ず以下のURLを案内してください:
@@ -664,7 +748,14 @@ async def generate_answer(question: str, server_context: str) -> str:
 --- 履歴ここまで ---"""
 
     all_tools = NOTION_TOOLS + STUDIO_TOOLS + GITHUB_TOOLS + [ADVISOR_TOOL]
-    messages = [{"role": "user", "content": question}]
+    user_prompt = f"""以下のDiscord会話文脈を読んだうえで、最後の「今回の発言」に返答してください。
+
+## 現在のDiscord会話文脈
+{conversation_context}
+
+## 今回の発言本文
+{question}"""
+    messages = [{"role": "user", "content": user_prompt}]
     max_iterations = 8
 
     for i in range(max_iterations):
@@ -859,9 +950,11 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
+            conversation_context = await fetch_conversation_context(message)
+            logger.info("直近会話コンテキスト取得完了 (%d文字)", len(conversation_context))
             server_context = await fetch_server_context(message.guild)
             logger.info("サーバー履歴取得完了 (%d文字)", len(server_context))
-            answer = await generate_answer(message.content, server_context)
+            answer = await generate_answer(message.content, conversation_context, server_context)
         except Exception:
             logger.exception("回答生成に失敗しました")
             await message.reply("申し訳ありません。回答の生成中にエラーが発生しました。")

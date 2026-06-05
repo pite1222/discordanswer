@@ -25,6 +25,26 @@ cp .env.example .env
 | `TARGET_CHANNEL_IDS` | 監視対象チャンネルID（カンマ区切り） |
 | `CLAUDE_MODEL` | 使用するClaudeモデル（デフォルト: `claude-sonnet-4-20250514`） |
 | `SYSTEM_PROMPT` | ボットの振る舞いを制御するプロンプト |
+| `CONVERSATION_CONTEXT_LIMIT` | 回答時に読む同一チャンネルの直近メッセージ数（デフォルト: `20`） |
+| `CONVERSATION_CONTEXT_MINUTES` | 回答時に読む直近会話の時間幅（デフォルト: `180`） |
+| `MAX_CONVERSATION_CONTEXT_CHARS` | 現在の会話文脈の最大文字数（デフォルト: `6000`） |
+| `NOTION_TOKEN` | Notion Internal Integration のシークレット |
+| `NOTION_CORRECTIONS_DB_ID` | 訂正ナレッジDBのID |
+
+### Notion 連携
+
+1. [Notion Integrations](https://www.notion.so/my-integrations) で Internal Integration を作成し、`NOTION_TOKEN` にシークレットを設定
+2. ユーザーガイドのページと訂正ナレッジDBを Integration に接続
+3. 訂正ナレッジDBに以下のプロパティを作成
+
+| プロパティ | 型 |
+|---|---|
+| `Topic` | Title |
+| `Correction` | Text |
+| `Question` | Text |
+| `WrongAnswer` | Text |
+
+`!訂正` と `!ナレッジ抽出` は、このDBに保存されます。ユーザーガイド検索は、Integration に接続されたNotionページを検索します。
 
 ### 3. Discord Bot の作成
 
@@ -42,5 +62,6 @@ python bot.py
 ## 動作
 
 - 指定チャンネルのメッセージを監視
-- `?`、`？`、`教えて`、`どう` などの質問マーカーを含むメッセージを検出
+- 返信先メッセージと同一チャンネルの直近会話を取得
+- 今回の発言を前後の文脈込みで解釈
 - Claude API で回答を生成し、リプライで返信
