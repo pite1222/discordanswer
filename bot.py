@@ -478,8 +478,9 @@ STUDIO_TOOLS = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "取得するパス（例: ''=トップ, 'firmware'=FW更新ページ, その他のサブページ）",
-                    "default": "",
+                    "description": "取得するページ（'guide'=全機能ガイド, 'firmware'=FWリリース一覧・最新版・各バージョンの更新内容とダウンロードURL）",
+                    "enum": ["guide", "firmware"],
+                    "default": "guide",
                 }
             },
         },
@@ -487,8 +488,14 @@ STUDIO_TOOLS = [
 ]
 
 
+# SPA本体はJSレンダリングでHTMLが空殻のため、ビルド時に生成されるテキスト版 (*.txt) を取得する
+STUDIO_TEXT_PAGES = {"": "guide.txt", "guide": "guide.txt", "firmware": "firmware.txt"}
+
+
 async def fetch_studio_guide(path: str = "") -> str:
-    url = f"{STUDIO_BASE_URL}/{path.lstrip('/')}"
+    page = path.strip().strip("/")
+    page = STUDIO_TEXT_PAGES.get(page.removesuffix(".txt"), page)
+    url = f"{STUDIO_BASE_URL}/{page}"
     try:
         resp = await http_client.get(url)
     except Exception as e:
@@ -507,8 +514,8 @@ async def fetch_studio_guide(path: str = "") -> str:
     text = re.sub(r"&quot;", '"', text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     text = "\n".join(lines)
-    if len(text) > 8000:
-        text = text[:8000] + f"\n\n... (truncated, total {len(text)} chars)"
+    if len(text) > 16000:
+        text = text[:16000] + f"\n\n... (truncated, total {len(text)} chars)"
     return f"URL: {url}\n\n{text}" if text else f"(空のページ: {url})"
 
 
@@ -754,6 +761,10 @@ async def refresh_studio_guide(force: bool = False):
     guide = await fetch_studio_guide("guide")
     if guide.startswith("Error:"):
         logger.warning("Studioガイド取得失敗 (既存キャッシュを維持): %s", guide[:100])
+        return
+    if len(guide) < 500:
+        # SPAフォールバック(index.htmlの殻)を掴むと中身のない短文になる
+        logger.warning("Studioガイドが短すぎます (%d文字, SPAフォールバックの疑い)。既存キャッシュを維持", len(guide))
         return
     studio_guide_cache = guide
     logger.info("Studioガイド更新 (%d文字)", len(studio_guide_cache))
