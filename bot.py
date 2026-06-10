@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import re
 import logging
+import time
 import base64
 from datetime import datetime, timedelta, timezone
 
@@ -27,7 +29,7 @@ TARGET_CHANNEL_IDS = {
     if cid.strip()
 }
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
-ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-opus-4-6")
+ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-opus-4-8")
 ADVISOR_MAX_USES = int(os.environ.get("ADVISOR_MAX_USES", "2"))
 SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
@@ -38,6 +40,10 @@ HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "30"))
 CONVERSATION_CONTEXT_LIMIT = int(os.environ.get("CONVERSATION_CONTEXT_LIMIT", "20"))
 CONVERSATION_CONTEXT_MINUTES = int(os.environ.get("CONVERSATION_CONTEXT_MINUTES", "180"))
 MAX_CONVERSATION_CONTEXT_CHARS = int(os.environ.get("MAX_CONVERSATION_CONTEXT_CHARS", "6000"))
+SERVER_CONTEXT_TTL_SECONDS = int(os.environ.get("SERVER_CONTEXT_TTL_SECONDS", "120"))
+PRIORITY_HISTORY_LIMIT = int(os.environ.get("PRIORITY_HISTORY_LIMIT", "1000"))
+STUDIO_GUIDE_REFRESH_SECONDS = int(os.environ.get("STUDIO_GUIDE_REFRESH_SECONDS", "21600"))
+GATE_MODEL = os.environ.get("GATE_MODEL", "claude-haiku-4-5")
 
 # Notion settings
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
@@ -54,6 +60,9 @@ PRIORITY_CHANNEL_NAMES = [
     for name in os.environ.get("PRIORITY_CHANNEL_NAMES", "トラブルシューティング,troubleshoot").split(",")
     if name.strip()
 ]
+
+# --- 共有HTTPクライアント (接続プール再利用) ---
+http_client = httpx.AsyncClient(timeout=15, follow_redirects=True)
 
 # --- Advisor Strategy ---
 ADVISOR_TOOL = {
@@ -121,8 +130,7 @@ def _github_headers() -> dict:
 async def github_get_tree(path: str = "") -> str:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
     params = {"ref": GITHUB_BRANCH}
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=_github_headers(), params=params)
+    resp = await http_client.get(url, headers=_github_headers(), params=params)
     if resp.status_code != 200:
         return f"Error: {resp.status_code} {resp.text[:200]}"
     items = resp.json()
@@ -139,8 +147,7 @@ async def github_get_tree(path: str = "") -> str:
 async def github_get_file(path: str) -> str:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
     params = {"ref": GITHUB_BRANCH}
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=_github_headers(), params=params)
+    resp = await http_client.get(url, headers=_github_headers(), params=params)
     if resp.status_code != 200:
         return f"Error: {resp.status_code} — file not found or inaccessible"
     data = resp.json()
@@ -155,8 +162,7 @@ async def github_get_file(path: str) -> str:
 async def github_search_code(query: str) -> str:
     url = "https://api.github.com/search/code"
     params = {"q": f"{query} repo:{GITHUB_REPO}"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=_github_headers(), params=params)
+    resp = await http_client.get(url, headers=_github_headers(), params=params)
     if resp.status_code != 200:
         return f"Error: {resp.status_code} {resp.text[:200]}"
     data = resp.json()
@@ -255,8 +261,7 @@ async def notion_search(query: str) -> str:
         return "Error: NOTION_TOKEN が設定されていません"
     url = "https://api.notion.com/v1/search"
     body = {"query": query, "page_size": 10}
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, headers=_notion_headers(), json=body)
+    resp = await http_client.post(url, headers=_notion_headers(), json=body)
     if resp.status_code != 200:
         return f"Error: {resp.status_code} {resp.text[:200]}"
     data = resp.json()
@@ -288,26 +293,25 @@ async def notion_get_page(page_id: str) -> str:
     all_blocks = []
     url = f"https://api.notion.com/v1/blocks/{page_id}/children"
     params = {"page_size": 100}
-    async with httpx.AsyncClient(timeout=15) as client:
-        while True:
-            resp = await client.get(url, headers=_notion_headers(), params=params)
-            if resp.status_code != 200:
-                return f"Error: {resp.status_code} {resp.text[:200]}"
-            data = resp.json()
-            all_blocks.extend(data.get("results", []))
-            if not data.get("has_more"):
-                break
-            params["start_cursor"] = data["next_cursor"]
+    while True:
+        resp = await http_client.get(url, headers=_notion_headers(), params=params)
+        if resp.status_code != 200:
+            return f"Error: {resp.status_code} {resp.text[:200]}"
+        data = resp.json()
+        all_blocks.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        params["start_cursor"] = data["next_cursor"]
 
-        expanded = []
-        for block in all_blocks:
-            expanded.append(block)
-            if block.get("has_children") and block["type"] not in ("child_page", "child_database"):
-                child_url = f"https://api.notion.com/v1/blocks/{block['id']}/children"
-                child_resp = await client.get(child_url, headers=_notion_headers(), params={"page_size": 100})
-                if child_resp.status_code == 200:
-                    children = child_resp.json().get("results", [])
-                    expanded.extend(children)
+    expanded = []
+    for block in all_blocks:
+        expanded.append(block)
+        if block.get("has_children") and block["type"] not in ("child_page", "child_database"):
+            child_url = f"https://api.notion.com/v1/blocks/{block['id']}/children"
+            child_resp = await http_client.get(child_url, headers=_notion_headers(), params={"page_size": 100})
+            if child_resp.status_code == 200:
+                children = child_resp.json().get("results", [])
+                expanded.extend(children)
 
     content = _blocks_to_text(expanded)
     if len(content) > 10000:
@@ -343,18 +347,19 @@ def _extract_topic(text: str) -> str:
     return text[:50]
 
 
-async def load_corrections() -> list[dict]:
+async def load_corrections() -> list[dict] | None:
+    # Notionエラー時はNoneを返し、呼び出し側で既存キャッシュを維持する
     results = [dict(item) for item in BUILTIN_CORRECTIONS]
     if not NOTION_TOKEN or not NOTION_CORRECTIONS_DB_ID:
         return results
     url = f"https://api.notion.com/v1/databases/{NOTION_CORRECTIONS_DB_ID}/query"
     body: dict = {"page_size": 100}
-    async with httpx.AsyncClient(timeout=15) as client:
+    try:
         while True:
-            resp = await client.post(url, headers=_notion_headers(), json=body)
+            resp = await http_client.post(url, headers=_notion_headers(), json=body)
             if resp.status_code != 200:
                 logger.error("訂正DB読み込み失敗: %d %s", resp.status_code, resp.text[:200])
-                break
+                return None
             data = resp.json()
             for page in data.get("results", []):
                 props = page.get("properties", {})
@@ -370,6 +375,9 @@ async def load_corrections() -> list[dict]:
             if not data.get("has_more"):
                 break
             body["start_cursor"] = data["next_cursor"]
+    except Exception:
+        logger.exception("訂正DB読み込みに失敗")
+        return None
     logger.info("訂正データ %d件 読み込み完了", len(results))
     return results
 
@@ -387,8 +395,11 @@ async def save_correction(topic: str, correction: str, question: str, wrong_answ
             "WrongAnswer": {"rich_text": [{"text": {"content": wrong_answer[:2000]}}]},
         },
     }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, headers=_notion_headers(), json=body)
+    try:
+        resp = await http_client.post(url, headers=_notion_headers(), json=body)
+    except Exception:
+        logger.exception("訂正保存に失敗")
+        return False
     if resp.status_code != 200:
         logger.error("訂正保存失敗: %d %s", resp.status_code, resp.text[:200])
         return False
@@ -413,30 +424,45 @@ async def extract_knowledge(history: list[str], existing_topics: list[str]) -> l
 ## 既に登録済みのトピック（重複を避けること）
 {existing_str}
 
-## 出力形式
-JSON配列で返してください。他のテキストは不要です。
-```json
-[
-  {{"topic": "トピック名（短く）", "correction": "正確な情報・解決方法", "question": "元の質問の要約"}},
-  ...
-]
-```
-
 ## チャンネル履歴
 {history_text}"""
 
     response = await claude.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
+        output_config={
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "topic": {"type": "string", "description": "トピック名（短く）"},
+                                    "correction": {"type": "string", "description": "正確な情報・解決方法"},
+                                    "question": {"type": "string", "description": "元の質問の要約"},
+                                },
+                                "required": ["topic", "correction", "question"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["items"],
+                    "additionalProperties": False,
+                },
+            }
+        },
     )
+    if response.stop_reason == "max_tokens":
+        logger.warning("ナレッジ抽出がmax_tokensで途中切断されました")
     text = "".join(block.text for block in response.content if hasattr(block, "text"))
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if not match:
-        return []
     try:
-        return json.loads(match.group())
-    except json.JSONDecodeError:
+        return json.loads(text)["items"]
+    except (json.JSONDecodeError, KeyError):
         logger.error("ナレッジ抽出のJSON解析に失敗")
         return []
 
@@ -464,8 +490,7 @@ STUDIO_TOOLS = [
 async def fetch_studio_guide(path: str = "") -> str:
     url = f"{STUDIO_BASE_URL}/{path.lstrip('/')}"
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(url)
+        resp = await http_client.get(url)
     except Exception as e:
         return f"Error: {e}"
     if resp.status_code != 200:
@@ -489,19 +514,23 @@ async def fetch_studio_guide(path: str = "") -> str:
 
 async def handle_tool_call(name: str, input_data: dict) -> str:
     logger.info("Tool call: %s(%s)", name, input_data)
-    if name == "search_notion":
-        return await notion_search(input_data["query"])
-    elif name == "get_notion_page":
-        return await notion_get_page(input_data["page_id"])
-    elif name == "fetch_studio_guide":
-        return await fetch_studio_guide(input_data.get("path", ""))
-    elif name == "get_repo_tree":
-        return await github_get_tree(input_data.get("path", ""))
-    elif name == "get_file_contents":
-        return await github_get_file(input_data["path"])
-    elif name == "search_code":
-        return await github_search_code(input_data["query"])
-    return f"Unknown tool: {name}"
+    try:
+        if name == "search_notion":
+            return await notion_search(input_data["query"])
+        elif name == "get_notion_page":
+            return await notion_get_page(input_data["page_id"])
+        elif name == "fetch_studio_guide":
+            return await fetch_studio_guide(input_data.get("path", ""))
+        elif name == "get_repo_tree":
+            return await github_get_tree(input_data.get("path", ""))
+        elif name == "get_file_contents":
+            return await github_get_file(input_data["path"])
+        elif name == "search_code":
+            return await github_search_code(input_data["query"])
+        return f"Unknown tool: {name}"
+    except Exception as e:
+        logger.exception("ツール %s の実行に失敗", name)
+        return f"Error: ツール実行に失敗しました ({e})"
 
 
 # --- Claude クライアント (async) ---
@@ -516,11 +545,16 @@ intents.message_content = True
 intents.members = True
 bot = discord.Client(intents=intents)
 
-# --- 優先チャンネルの全履歴キャッシュ ---
+# --- 優先チャンネルの履歴キャッシュ ---
 priority_cache: dict[int, list[str]] = {}
 priority_cache_last_id: dict[int, int] = {}
 corrections_cache: list[dict] = []
 studio_guide_cache: str = ""
+_studio_guide_fetched_at: float = 0.0
+_server_context_cache: dict[int, tuple[float, str]] = {}
+_server_context_lock = asyncio.Lock()
+answer_semaphore = asyncio.Semaphore(2)
+_initialized = False
 
 
 def is_priority_channel(channel: discord.TextChannel) -> bool:
@@ -595,21 +629,20 @@ async def fetch_conversation_context(message: discord.Message) -> str:
 
 
 async def load_full_history(channel: discord.TextChannel) -> list[str]:
+    # 消費側はサーバーコンテキストで直近100件・ナレッジ抽出で直近300件しか使わないため、
+    # 直近 PRIORITY_HISTORY_LIMIT 件だけを新しい順に取得して古い順に並べ直す
     messages = []
-    count = 0
     try:
-        async for msg in channel.history(limit=None, oldest_first=True):
+        async for msg in channel.history(limit=PRIORITY_HISTORY_LIMIT, oldest_first=False):
             if msg.author == bot.user:
                 continue
             messages.append(format_message(msg))
-            count += 1
-            if count % 500 == 0:
-                logger.info("  #%s: %d件取得中...", channel.name, count)
     except discord.Forbidden:
         logger.warning("チャンネル #%s の履歴取得権限がありません", channel.name)
     except Exception:
-        logger.exception("チャンネル #%s の全履歴取得に失敗", channel.name)
-    logger.info("  #%s: 全履歴 %d件 取得完了", channel.name, len(messages))
+        logger.exception("チャンネル #%s の履歴取得に失敗", channel.name)
+    messages.reverse()
+    logger.info("  #%s: 直近 %d件 取得完了", channel.name, len(messages))
     return messages
 
 
@@ -631,10 +664,13 @@ async def update_priority_cache(channel: discord.TextChannel):
         logger.exception("キャッシュ差分更新に失敗: #%s", channel.name)
         return
     if new_messages:
-        priority_cache[channel.id].extend(new_messages)
+        cache = priority_cache[channel.id]
+        cache.extend(new_messages)
+        if len(cache) > PRIORITY_HISTORY_LIMIT:
+            del cache[:-PRIORITY_HISTORY_LIMIT]
         priority_cache_last_id[channel.id] = last_id
         logger.info("#%s: キャッシュに %d件 追加 (合計 %d件)",
-                    channel.name, len(new_messages), len(priority_cache[channel.id]))
+                    channel.name, len(new_messages), len(cache))
 
 
 async def fetch_channel_history(channel: discord.TextChannel, limit: int = 200) -> list[str]:
@@ -666,7 +702,8 @@ async def fetch_server_context(guild: discord.Guild) -> str:
     ordered_channels = priority_channels + other_channels
 
     for channel in ordered_channels:
-        if total_chars >= MAX_CONTEXT_CHARS:
+        remaining = MAX_CONTEXT_CHARS - total_chars
+        if remaining <= 0:
             break
         permissions = channel.permissions_for(guild.me)
         if not permissions.read_messages or not permissions.read_message_history:
@@ -674,25 +711,97 @@ async def fetch_server_context(guild: discord.Guild) -> str:
         if is_priority_channel(channel):
             await update_priority_cache(channel)
             history = priority_cache.get(channel.id, [])
-            if history:
-                recent = history[-100:]
-                header = f"=== #{channel.name} (最新{len(recent)}件 / 全{len(history)}件) ==="
-                all_history.append(header)
-                all_history.extend(recent)
-                all_history.append("")
-                total_chars += sum(len(m) for m in recent)
+            recent = history[-100:]
+            header = f"=== #{channel.name} (直近{len(recent)}件 / 保持{len(history)}件) ==="
         else:
-            history = await fetch_channel_history(channel, limit=HISTORY_FETCH_LIMIT)
-            if history:
-                all_history.append(f"=== #{channel.name} ===")
-                all_history.extend(history)
-                all_history.append("")
-                total_chars += sum(len(m) for m in history)
+            recent = await fetch_channel_history(channel, limit=HISTORY_FETCH_LIMIT)
+            header = f"=== #{channel.name} ==="
+        if not recent:
+            continue
+        # 枠を超える場合は古いメッセージから削り、先頭の優先チャンネルを末尾切り詰めで失わないようにする
+        while recent and len(header) + sum(len(m) + 1 for m in recent) > remaining:
+            recent.pop(0)
+        if not recent:
+            break
+        all_history.append(header)
+        all_history.extend(recent)
+        all_history.append("")
+        total_chars += len(header) + sum(len(m) + 1 for m in recent)
 
-    result = "\n".join(all_history)
-    if len(result) > MAX_CONTEXT_CHARS:
-        result = result[-MAX_CONTEXT_CHARS:]
-    return result
+    return "\n".join(all_history)
+
+
+async def get_server_context(guild: discord.Guild) -> str:
+    # SERVER_CONTEXT_TTL_SECONDS の間はDiscordから再取得せずキャッシュを返す。
+    # ロックで再構築の並行実行(update_priority_cacheの競合含む)も防ぐ。
+    cached = _server_context_cache.get(guild.id)
+    if cached and time.monotonic() - cached[0] < SERVER_CONTEXT_TTL_SECONDS:
+        return cached[1]
+    async with _server_context_lock:
+        cached = _server_context_cache.get(guild.id)
+        if cached and time.monotonic() - cached[0] < SERVER_CONTEXT_TTL_SECONDS:
+            return cached[1]
+        context = await fetch_server_context(guild)
+        _server_context_cache[guild.id] = (time.monotonic(), context)
+        return context
+
+
+async def refresh_studio_guide(force: bool = False):
+    global studio_guide_cache, _studio_guide_fetched_at
+    if not force and time.monotonic() - _studio_guide_fetched_at < STUDIO_GUIDE_REFRESH_SECONDS:
+        return
+    _studio_guide_fetched_at = time.monotonic()  # 失敗時も次の間隔まで再試行しない
+    guide = await fetch_studio_guide("guide")
+    if guide.startswith("Error:"):
+        logger.warning("Studioガイド取得失敗 (既存キャッシュを維持): %s", guide[:100])
+        return
+    studio_guide_cache = guide
+    logger.info("Studioガイド更新 (%d文字)", len(studio_guide_cache))
+
+
+async def should_respond(message: discord.Message, conversation_context: str) -> bool:
+    # メンション/ボットへの返信は無条件で回答。それ以外はHaikuで要返答判定する
+    if bot.user in message.mentions:
+        return True
+    if message.reference:
+        referenced = await fetch_referenced_message(message)
+        if referenced and referenced.author == bot.user:
+            return True
+    try:
+        gate = await claude.messages.create(
+            model=GATE_MODEL,
+            max_tokens=4,
+            system=(
+                "Discordサポートチャンネルの発言が、サポートボットの返答を必要とするか判定する。"
+                "質問・トラブル報告・直前の会話の続きの相談(「試しました」「同じ症状です」など)なら yes、"
+                "お礼・完了報告・雑談・相槌だけなら no とだけ出力する。判断に迷ったら yes。"
+            ),
+            messages=[{
+                "role": "user",
+                "content": f"直近の会話:\n{conversation_context[-1500:]}\n\n判定対象の発言: {message.content}",
+            }],
+        )
+        verdict = "".join(block.text for block in gate.content if hasattr(block, "text")).strip().lower()
+        logger.info("要返答判定: %s (%s)", verdict, message.content[:50])
+        return not verdict.startswith("no")
+    except Exception:
+        logger.exception("要返答判定に失敗。回答にフォールバックします")
+        return True
+
+
+def _move_cache_marker(messages: list) -> None:
+    # 直近メッセージの末尾ブロックにcache_controlを移し、messages内のbreakpointを常に1個に保つ
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    block.pop("cache_control", None)
+    last = messages[-1]
+    if isinstance(last, dict) and isinstance(last.get("content"), list):
+        blocks = last["content"]
+        if blocks and isinstance(blocks[-1], dict):
+            blocks[-1]["cache_control"] = {"type": "ephemeral"}
 
 
 async def generate_answer(question: str, conversation_context: str, server_context: str) -> str:
@@ -712,7 +821,7 @@ async def generate_answer(question: str, conversation_context: str, server_conte
             + "\n"
         )
 
-    system = f"""{SYSTEM_PROMPT}
+    stable_system = f"""{SYSTEM_PROMPT}
 {corrections_block}
 ## 回答の優先順位（厳守）
 1. **最優先（同列）: Notionユーザーガイド と Studio公式サイト** — どちらも公式情報源。質問の内容に応じて以下のツールで取得してください:
@@ -740,12 +849,19 @@ async def generate_answer(question: str, conversation_context: str, server_conte
 ## Studio公式ガイド（常に参照すること）
 --- Studio Guide ({STUDIO_BASE_URL}/guide) ---
 {studio_guide_cache}
---- ガイドここまで ---
+--- ガイドここまで ---"""
 
-## Discordサーバー履歴
+    history_system = f"""## Discordサーバー履歴
 --- サーバー履歴 ---
 {server_context}
 --- 履歴ここまで ---"""
+
+    # prompt caching: tools+安定部 / サーバー履歴 / 直近メッセージ の3breakpointで
+    # agentic loopのiteration間と質問間のprefix再利用を効かせる
+    system = [
+        {"type": "text", "text": stable_system, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": history_system, "cache_control": {"type": "ephemeral"}},
+    ]
 
     all_tools = NOTION_TOOLS + STUDIO_TOOLS + GITHUB_TOOLS + [ADVISOR_TOOL]
     user_prompt = f"""以下のDiscord会話文脈を読んだうえで、最後の「今回の発言」に返答してください。
@@ -755,39 +871,73 @@ async def generate_answer(question: str, conversation_context: str, server_conte
 
 ## 今回の発言本文
 {question}"""
-    messages = [{"role": "user", "content": user_prompt}]
+    messages = [{"role": "user", "content": [{"type": "text", "text": user_prompt}]}]
     max_iterations = 8
 
     for i in range(max_iterations):
+        _move_cache_marker(messages)
         response = await claude.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=2048,
+            max_tokens=8192,
             system=system,
             messages=messages,
             tools=all_tools,
+            thinking={"type": "adaptive"},
             extra_headers=ADVISOR_HEADERS,
         )
-        logger.info("Claude応答 [iter=%d]: stop_reason=%s, blocks=%d",
-                    i, response.stop_reason, len(response.content))
+        usage = response.usage
+        logger.info(
+            "Claude応答 [iter=%d]: stop_reason=%s, blocks=%d, in=%d, cache_read=%d, cache_write=%d, out=%d",
+            i, response.stop_reason, len(response.content),
+            usage.input_tokens, usage.cache_read_input_tokens or 0,
+            usage.cache_creation_input_tokens or 0, usage.output_tokens,
+        )
+
+        if response.stop_reason == "pause_turn":
+            # server-sideツール(advisor)の一時停止。そのまま再送して続行する
+            messages.append({"role": "assistant", "content": response.content})
+            continue
 
         if response.stop_reason != "tool_use":
+            if response.stop_reason == "max_tokens":
+                logger.warning("回答がmax_tokensで途中切断 (out=%d)", usage.output_tokens)
             return "".join(
                 block.text for block in response.content if hasattr(block, "text")
             )
 
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                result = await handle_tool_call(block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
+        tool_blocks = [block for block in response.content if block.type == "tool_use"]
+        if not tool_blocks:
+            return "".join(
+                block.text for block in response.content if hasattr(block, "text")
+            )
+        results = await asyncio.gather(
+            *(handle_tool_call(block.name, block.input) for block in tool_blocks)
+        )
+        tool_results = [
+            {"type": "tool_result", "tool_use_id": block.id, "content": result}
+            for block, result in zip(tool_blocks, results)
+        ]
 
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results})
 
+    # ループ上限到達: ツール使用を打ち切り、得た情報だけで最終回答をまとめさせる
+    logger.warning("max_iterations (%d) 到達。最終回答を生成します", max_iterations)
+    messages.append({
+        "role": "user",
+        "content": [{"type": "text", "text": "ツール使用はここまでです。これまでに得た情報だけで最終回答をまとめてください。"}],
+    })
+    _move_cache_marker(messages)
+    response = await claude.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=8192,
+        system=system,
+        messages=messages,
+        tools=all_tools,
+        tool_choice={"type": "none"},
+        thinking={"type": "adaptive"},
+        extra_headers=ADVISOR_HEADERS,
+    )
     return "".join(
         block.text for block in response.content if hasattr(block, "text")
     )
@@ -795,13 +945,19 @@ async def generate_answer(question: str, conversation_context: str, server_conte
 
 @bot.event
 async def on_ready():
+    global _initialized, corrections_cache
     logger.info("ボット起動: %s (ID: %s)", bot.user.name, bot.user.id)
+    if _initialized:
+        logger.info("再接続のため初期化をスキップ")
+        return
+    _initialized = True
+
     if TARGET_CHANNEL_IDS:
         logger.info("監視チャンネル: %s", TARGET_CHANNEL_IDS)
     else:
         logger.warning("TARGET_CHANNEL_IDS が未設定です。すべてのチャンネルで応答します。")
 
-    logger.info("優先チャンネルの全履歴を読み込み中...")
+    logger.info("優先チャンネルの履歴を読み込み中...")
     for guild in bot.guilds:
         for channel in guild.text_channels:
             if is_priority_channel(channel):
@@ -809,24 +965,26 @@ async def on_ready():
                 if not permissions.read_messages or not permissions.read_message_history:
                     logger.warning("  #%s: 権限不足でスキップ", channel.name)
                     continue
-                logger.info("  #%s の全履歴を取得開始...", channel.name)
+                logger.info("  #%s の履歴を取得開始...", channel.name)
                 history = await load_full_history(channel)
                 priority_cache[channel.id] = history
+                # 空チャンネルでも差分更新が動くよう、チャンネル作成時点のsnowflakeを起点にする
+                last_id = channel.id
                 try:
                     async for msg in channel.history(limit=1):
-                        priority_cache_last_id[channel.id] = msg.id
+                        last_id = msg.id
                         break
                 except Exception:
                     pass
+                priority_cache_last_id[channel.id] = last_id
     logger.info("優先チャンネルの読み込み完了 (合計 %d件)",
                 sum(len(v) for v in priority_cache.values()))
 
-    global corrections_cache, studio_guide_cache
-    corrections_cache = await load_corrections()
+    loaded = await load_corrections()
+    corrections_cache = loaded if loaded is not None else [dict(item) for item in BUILTIN_CORRECTIONS]
 
     logger.info("Studio ガイドページを取得中...")
-    studio_guide_cache = await fetch_studio_guide("guide")
-    logger.info("Studio ガイド取得完了 (%d文字)", len(studio_guide_cache))
+    await refresh_studio_guide(force=True)
 
     logger.info("ボット準備完了！")
 
@@ -837,6 +995,8 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
     if message.author.bot:
+        return
+    if message.guild is None:
         return
 
     logger.info("MSG [#%s] ch_id=%s %s: %s",
@@ -884,7 +1044,9 @@ async def on_message(message: discord.Message):
         )
 
         if success:
-            corrections_cache = await load_corrections()
+            loaded = await load_corrections()
+            if loaded is not None:
+                corrections_cache = loaded
             reply_lines = [
                 "✅ 訂正を記録しました。\n",
                 f"**トピック:** {topic}",
@@ -903,6 +1065,13 @@ async def on_message(message: discord.Message):
             await message.reply("このコマンドはサーバーオーナーのみ使用できます。")
             return
 
+        # ゲートでスキップされた完了報告等も拾えるよう、抽出前に差分を取り込む
+        async with _server_context_lock:
+            for ch_id in list(priority_cache.keys()):
+                channel = bot.get_channel(ch_id)
+                if isinstance(channel, discord.TextChannel):
+                    await update_priority_cache(channel)
+
         all_history = []
         for ch_id, history in priority_cache.items():
             all_history.extend(history)
@@ -912,7 +1081,7 @@ async def on_message(message: discord.Message):
             return
 
         existing_topics = [c["topic"] for c in corrections_cache]
-        await message.reply(f"ナレッジ抽出を開始します（履歴 {len(all_history)}件を分析中...）")
+        await message.reply(f"ナレッジ抽出を開始します（直近 {min(len(all_history), 300)}件を分析中...）")
 
         async with message.channel.typing():
             knowledge = await extract_knowledge(all_history, existing_topics)
@@ -932,7 +1101,9 @@ async def on_message(message: discord.Message):
             if success:
                 saved += 1
 
-        corrections_cache = await load_corrections()
+        loaded = await load_corrections()
+        if loaded is not None:
+            corrections_cache = loaded
 
         topics_list = "\n".join(f"- {item.get('topic', '')}" for item in knowledge[:10])
         await message.reply(
@@ -945,26 +1116,40 @@ async def on_message(message: discord.Message):
     if TARGET_CHANNEL_IDS and message.channel.id not in TARGET_CHANNEL_IDS:
         return
 
+    conversation_context = await fetch_conversation_context(message)
+    if not await should_respond(message, conversation_context):
+        logger.info("要返答でないと判定したためスキップ [#%s] %s: %s",
+                    message.channel.name, message.author.name, message.content[:50])
+        return
+
     logger.info("応答開始 [#%s] %s: %s",
                 message.channel.name, message.author.name, message.content[:80])
 
     async with message.channel.typing():
         try:
-            conversation_context = await fetch_conversation_context(message)
-            logger.info("直近会話コンテキスト取得完了 (%d文字)", len(conversation_context))
-            server_context = await fetch_server_context(message.guild)
-            logger.info("サーバー履歴取得完了 (%d文字)", len(server_context))
-            answer = await generate_answer(message.content, conversation_context, server_context)
+            await refresh_studio_guide()
+            server_context = await get_server_context(message.guild)
+            logger.info("コンテキスト取得完了 (会話%d文字 / サーバー履歴%d文字)",
+                        len(conversation_context), len(server_context))
+            async with answer_semaphore:
+                answer = await generate_answer(message.content, conversation_context, server_context)
         except Exception:
             logger.exception("回答生成に失敗しました")
             await message.reply("申し訳ありません。回答の生成中にエラーが発生しました。")
             return
 
-    if len(answer) > 2000:
-        for i in range(0, len(answer), 2000):
-            await message.reply(answer[i : i + 2000])
-    else:
-        await message.reply(answer)
+    if not answer.strip():
+        logger.warning("空の回答が生成されたためフォールバック文を返します")
+        answer = "申し訳ありません。今回はうまく回答をまとめられませんでした。質問の内容を少し変えてもう一度試してください。"
+
+    try:
+        if len(answer) > 2000:
+            for i in range(0, len(answer), 2000):
+                await message.reply(answer[i : i + 2000])
+        else:
+            await message.reply(answer)
+    except discord.HTTPException:
+        logger.exception("回答の送信に失敗しました")
 
 
 def main():
