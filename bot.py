@@ -61,6 +61,9 @@ PRIORITY_CHANNEL_NAMES = [
     if name.strip()
 ]
 
+DAILY_TOKEN_LIMIT = int(os.environ.get("DAILY_TOKEN_LIMIT", "2000000"))  # 0で無効
+HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("HEALTH_CHECK_INTERVAL_SECONDS", "21600"))
+
 # --- 共有HTTPクライアント (接続プール再利用) ---
 http_client = httpx.AsyncClient(timeout=15, follow_redirects=True)
 
@@ -457,6 +460,7 @@ async def extract_knowledge(history: list[str], existing_topics: list[str]) -> l
             }
         },
     )
+    add_usage(response.usage)
     if response.stop_reason == "max_tokens":
         logger.warning("ナレッジ抽出がmax_tokensで途中切断されました")
     text = "".join(block.text for block in response.content if hasattr(block, "text"))
@@ -562,6 +566,15 @@ _server_context_cache: dict[int, tuple[float, str]] = {}
 _server_context_lock = asyncio.Lock()
 answer_semaphore = asyncio.Semaphore(2)
 _initialized = False
+
+JST = timezone(timedelta(hours=9))
+paused = False
+pause_reason = ""
+stats = {"answers": 0, "gate_evals": 0, "gate_pass": 0, "cache_read": 0}
+daily_usage = {"date": "", "tokens": 0, "auto_pause_done": False}
+health_state: dict = {}
+_last_health_failures: set[str] = set()
+last_seen_firmware_version = ""
 
 
 def is_priority_channel(channel: discord.TextChannel) -> bool:
@@ -770,6 +783,148 @@ async def refresh_studio_guide(force: bool = False):
     logger.info("Studioガイド更新 (%d文字)", len(studio_guide_cache))
 
 
+def _roll_daily() -> None:
+    global paused, pause_reason
+    today = datetime.now(JST).date().isoformat()
+    if today != daily_usage["date"]:
+        daily_usage["date"] = today
+        daily_usage["tokens"] = 0
+        daily_usage["auto_pause_done"] = False
+        if paused and pause_reason == "daily_limit":
+            paused = False
+            pause_reason = ""
+            logger.info("日次ロールオーバーにより自動回答を再開")
+
+
+def add_usage(usage) -> None:
+    global paused, pause_reason
+    if usage is None:
+        return
+    _roll_daily()
+    input_tokens = usage.input_tokens or 0
+    output_tokens = usage.output_tokens or 0
+    cache_creation = usage.cache_creation_input_tokens or 0
+    cache_read = usage.cache_read_input_tokens or 0
+    stats["cache_read"] += cache_read
+    daily_usage["tokens"] += input_tokens + output_tokens + cache_creation
+    if (
+        DAILY_TOKEN_LIMIT > 0
+        and not paused
+        and not daily_usage["auto_pause_done"]
+        and daily_usage["tokens"] > DAILY_TOKEN_LIMIT
+    ):
+        paused = True
+        pause_reason = "daily_limit"
+        daily_usage["auto_pause_done"] = True
+        logger.warning("日次トークン上限超過のため自動回答を停止 (%d / %d)",
+                       daily_usage["tokens"], DAILY_TOKEN_LIMIT)
+        asyncio.create_task(dm_owner(
+            f"🛑 日次トークン上限を超過したため自動回答を一時停止しました\n"
+            f"daily_tokens: {daily_usage['tokens']:,} / {DAILY_TOKEN_LIMIT:,}\n"
+            f"`!resume` で再開できます (翌日0時JSTに自動解除)"
+        ))
+
+
+async def dm_owner(text: str) -> None:
+    if not bot.guilds:
+        logger.warning("guildが無いためオーナーDMを送れません")
+        return
+    try:
+        guild = bot.guilds[0]
+        owner = guild.owner or await bot.fetch_user(guild.owner_id)
+        await owner.send(text)
+    except Exception:
+        logger.exception("オーナーDMの送信に失敗")
+
+
+def _parse_firmware_version(text: str) -> str:
+    m = re.search(r"最新バージョン:\s*(v[\d.]+)", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"^## (v[\d.]+)", text, re.MULTILINE)
+    if m:
+        return m.group(1)
+    return ""
+
+
+async def run_health_check(*, notify: bool, force_guide: bool = False) -> dict:
+    global last_seen_firmware_version, corrections_cache, _last_health_failures
+    await refresh_studio_guide(force=force_guide)
+    guide_chars = len(studio_guide_cache)
+
+    fw_text = await fetch_studio_guide("firmware")
+    fw_error = fw_text.startswith("Error:") or fw_text.startswith("(空")
+    firmware_chars = 0 if fw_error else len(fw_text)
+    firmware_version = "" if fw_error else _parse_firmware_version(fw_text)
+
+    version_changed = False
+    if firmware_version and firmware_version != last_seen_firmware_version:
+        if last_seen_firmware_version:
+            version_changed = True
+            logger.info("FWバージョン変化検知: %s → %s", last_seen_firmware_version, firmware_version)
+        else:
+            logger.info("FWバージョン初回記録: %s", firmware_version)
+        last_seen_firmware_version = firmware_version
+
+    loaded = await load_corrections()
+    if loaded is not None:
+        corrections_cache = loaded
+    notion_corrections = len(corrections_cache)
+
+    failures: set[str] = set()
+    if guide_chars < 500:
+        failures.add("guide_chars_low")
+    if fw_error:
+        failures.add("firmware_fetch_failed")
+    if not fw_error and firmware_chars < 500:
+        failures.add("firmware_chars_low")
+    if not fw_error and not firmware_version:
+        failures.add("firmware_version_unparsed")
+    if NOTION_TOKEN and loaded is None:
+        failures.add("notion_fetch_failed")
+
+    health_state["guide_chars"] = guide_chars
+    health_state["firmware_version"] = firmware_version
+    health_state["firmware_chars"] = firmware_chars
+    health_state["notion_corrections"] = notion_corrections
+    health_state["checked_at"] = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
+
+    if notify:
+        new_failures = failures - _last_health_failures
+        if new_failures:
+            await dm_owner(
+                "⚠️ ヘルスチェック異常\n"
+                f"失敗項目: {', '.join(sorted(new_failures))}\n"
+                f"guide_chars: {guide_chars}\n"
+                f"firmware_version: {firmware_version or '(取得失敗)'}\n"
+                f"firmware_chars: {firmware_chars}\n"
+                f"notion_corrections: {notion_corrections}"
+            )
+        recovered = _last_health_failures - failures
+        if recovered:
+            logger.info("ヘルスチェック回復: %s", ", ".join(sorted(recovered)))
+        _last_health_failures = failures
+
+    return {
+        "guide_chars": guide_chars,
+        "firmware_version": firmware_version,
+        "firmware_chars": firmware_chars,
+        "notion_corrections": notion_corrections,
+        "checked_at": health_state["checked_at"],
+        "version_changed": version_changed,
+        "failures": failures,
+    }
+
+
+async def health_check_loop():
+    while True:
+        await asyncio.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
+        try:
+            await run_health_check(notify=True)
+        except Exception:
+            logger.exception("定期ヘルスチェックに失敗")
+
+
 async def should_respond(message: discord.Message, conversation_context: str) -> bool:
     # メンション/ボットへの返信は無条件で回答。それ以外はHaikuで要返答判定する
     if bot.user in message.mentions:
@@ -794,7 +949,12 @@ async def should_respond(message: discord.Message, conversation_context: str) ->
         )
         verdict = "".join(block.text for block in gate.content if hasattr(block, "text")).strip().lower()
         logger.info("要返答判定: %s (%s)", verdict, message.content[:50])
-        return not verdict.startswith("no")
+        add_usage(gate.usage)
+        stats["gate_evals"] += 1
+        is_yes = not verdict.startswith("no")
+        if is_yes:
+            stats["gate_pass"] += 1
+        return is_yes
     except Exception:
         logger.exception("要返答判定に失敗。回答にフォールバックします")
         return True
@@ -896,6 +1056,7 @@ async def generate_answer(question: str, conversation_context: str, server_conte
             thinking={"type": "adaptive"},
             extra_headers=ADVISOR_HEADERS,
         )
+        add_usage(response.usage)
         usage = response.usage
         logger.info(
             "Claude応答 [iter=%d]: stop_reason=%s, blocks=%d, in=%d, cache_read=%d, cache_write=%d, out=%d",
@@ -949,6 +1110,7 @@ async def generate_answer(question: str, conversation_context: str, server_conte
         thinking={"type": "adaptive"},
         extra_headers=ADVISOR_HEADERS,
     )
+    add_usage(response.usage)
     return "".join(
         block.text for block in response.content if hasattr(block, "text")
     )
@@ -997,12 +1159,15 @@ async def on_ready():
     logger.info("Studio ガイドページを取得中...")
     await refresh_studio_guide(force=True)
 
+    await run_health_check(notify=True)
+    asyncio.create_task(health_check_loop())
+
     logger.info("ボット準備完了！")
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    global corrections_cache
+    global corrections_cache, paused, pause_reason
     if message.author == bot.user:
         return
     if message.author.bot:
@@ -1013,6 +1178,67 @@ async def on_message(message: discord.Message):
     logger.info("MSG [#%s] ch_id=%s %s: %s",
                 getattr(message.channel, 'name', '?'), message.channel.id,
                 message.author.name, message.content[:80])
+
+    content = message.content.strip()
+    if content in ("!pause", "!resume", "!status", "!release_check"):
+        if message.author.id != message.guild.owner_id:
+            await message.reply("このコマンドはサーバーオーナーのみ使用できます。")
+            return
+        if content == "!pause":
+            paused = True
+            pause_reason = "manual"
+            await message.reply("⏸️ 自動回答を一時停止しました。`!resume` で再開します。")
+        elif content == "!resume":
+            paused = False
+            pause_reason = ""
+            await message.reply("▶️ 自動回答を再開しました。")
+        elif content == "!status":
+            _roll_daily()
+            lines = []
+            if paused:
+                lines.append(f"paused: True ({pause_reason})")
+            else:
+                lines.append("paused: False")
+            lines.append(f"daily_tokens: {daily_usage['tokens']:,} / {DAILY_TOKEN_LIMIT:,}")
+            lines.append(f"answers: {stats['answers']}")
+            if stats["gate_evals"] == 0:
+                lines.append("gate_pass_rate: n/a")
+            else:
+                rate = stats["gate_pass"] / stats["gate_evals"] * 100
+                lines.append(f"gate_pass_rate: {stats['gate_pass']}/{stats['gate_evals']} ({rate:.1f}%)")
+            lines.append(f"cache_read: {stats['cache_read']:,}")
+            if health_state:
+                lines.append(f"guide_chars: {health_state['guide_chars']}")
+                lines.append(f"firmware_version: {health_state['firmware_version']}")
+                lines.append(f"firmware_chars: {health_state['firmware_chars']}")
+                lines.append(f"notion_corrections: {health_state['notion_corrections']}")
+                lines.append(f"last_health_check: {health_state['checked_at']}")
+            else:
+                lines.append("guide_chars: (未実施)")
+                lines.append("firmware_version: (未実施)")
+                lines.append("firmware_chars: (未実施)")
+                lines.append("notion_corrections: (未実施)")
+                lines.append("last_health_check: (未実施)")
+            await message.reply("```\n" + "\n".join(lines) + "\n```")
+        elif content == "!release_check":
+            old_version = last_seen_firmware_version
+            async with message.channel.typing():
+                result = await run_health_check(notify=False, force_guide=True)
+            if result["version_changed"]:
+                fw_line = f"firmware_version: 🆕 {old_version} → {result['firmware_version']}"
+            else:
+                fw_line = f"firmware_version: {result['firmware_version']} (変化なし)"
+            reply_lines = [
+                "🔄 リリース確認完了",
+                fw_line,
+                f"firmware_chars: {result['firmware_chars']}",
+                f"guide_chars: {result['guide_chars']}",
+                f"notion_corrections: {result['notion_corrections']}",
+            ]
+            if result["failures"]:
+                reply_lines.append(f"⚠️ 異常: {', '.join(sorted(result['failures']))}")
+            await message.reply("\n".join(reply_lines))
+        return
 
     if message.content.startswith("!訂正"):
         if message.author.id != message.guild.owner_id:
@@ -1127,6 +1353,12 @@ async def on_message(message: discord.Message):
     if TARGET_CHANNEL_IDS and message.channel.id not in TARGET_CHANNEL_IDS:
         return
 
+    # paused中はadd_usage経由のロールオーバーが走らないため、ここで日次解除を判定する
+    _roll_daily()
+    if paused:
+        logger.info("一時停止中のためスキップ [#%s] %s", message.channel.name, message.author.name)
+        return
+
     conversation_context = await fetch_conversation_context(message)
     if not await should_respond(message, conversation_context):
         logger.info("要返答でないと判定したためスキップ [#%s] %s: %s",
@@ -1159,6 +1391,7 @@ async def on_message(message: discord.Message):
                 await message.reply(answer[i : i + 2000])
         else:
             await message.reply(answer)
+        stats["answers"] += 1
     except discord.HTTPException:
         logger.exception("回答の送信に失敗しました")
 
