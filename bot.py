@@ -352,37 +352,42 @@ def _extract_topic(text: str) -> str:
 
 async def load_corrections() -> list[dict] | None:
     # Notionエラー時はNoneを返し、呼び出し側で既存キャッシュを維持する
-    results = [dict(item) for item in BUILTIN_CORRECTIONS]
     if not NOTION_TOKEN or not NOTION_CORRECTIONS_DB_ID:
-        return results
+        return [dict(item) for item in BUILTIN_CORRECTIONS]
     url = f"https://api.notion.com/v1/databases/{NOTION_CORRECTIONS_DB_ID}/query"
-    body: dict = {"page_size": 100}
-    try:
-        while True:
-            resp = await http_client.post(url, headers=_notion_headers(), json=body)
-            if resp.status_code != 200:
-                logger.error("訂正DB読み込み失敗: %d %s", resp.status_code, resp.text[:200])
+    for attempt in range(3):
+        results = [dict(item) for item in BUILTIN_CORRECTIONS]
+        body: dict = {"page_size": 100}
+        try:
+            while True:
+                resp = await http_client.post(url, headers=_notion_headers(), json=body)
+                if resp.status_code != 200:
+                    logger.error("訂正DB読み込み失敗: %d %s", resp.status_code, resp.text[:200])
+                    return None
+                data = resp.json()
+                for page in data.get("results", []):
+                    props = page.get("properties", {})
+                    topic = _extract_rich_text(props.get("Topic", {}).get("title", []))
+                    correction = _extract_rich_text(props.get("Correction", {}).get("rich_text", []))
+                    question = _extract_rich_text(props.get("Question", {}).get("rich_text", []))
+                    if correction:
+                        results.append({
+                            "topic": topic,
+                            "correction": correction,
+                            "question": question,
+                        })
+                if not data.get("has_more"):
+                    break
+                body["start_cursor"] = data["next_cursor"]
+        except Exception:
+            if attempt == 2:
+                logger.exception("訂正DB読み込みに失敗 (3回リトライ後)")
                 return None
-            data = resp.json()
-            for page in data.get("results", []):
-                props = page.get("properties", {})
-                topic = _extract_rich_text(props.get("Topic", {}).get("title", []))
-                correction = _extract_rich_text(props.get("Correction", {}).get("rich_text", []))
-                question = _extract_rich_text(props.get("Question", {}).get("rich_text", []))
-                if correction:
-                    results.append({
-                        "topic": topic,
-                        "correction": correction,
-                        "question": question,
-                    })
-            if not data.get("has_more"):
-                break
-            body["start_cursor"] = data["next_cursor"]
-    except Exception:
-        logger.exception("訂正DB読み込みに失敗")
-        return None
-    logger.info("訂正データ %d件 読み込み完了", len(results))
-    return results
+            await asyncio.sleep(2 ** attempt)
+            continue
+        logger.info("訂正データ %d件 読み込み完了", len(results))
+        return results
+    return None
 
 
 async def save_correction(topic: str, correction: str, question: str, wrong_answer: str) -> bool:
